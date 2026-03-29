@@ -18,13 +18,23 @@ Protocol (JSON over WebSocket):
     Worker -> UI:  {"type": "error",   "id": "...", "message": "..."}
 """
 
+import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 import pickle
 import sys
 import tempfile
+
+# Disable telemetry and analytics before importing any third-party libraries
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["ANONYMIZED_TELEMETRY"] = "False"  # ChromaDB
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pathlib import Path
 
@@ -40,8 +50,13 @@ from ingest import BM25_PATH, CHROMA_DIR, COLLECTION_NAME, chunk_text
 
 load_dotenv()
 
-UI_URL = os.getenv("UI_URL", "ws://localhost:7777/ws/worker")
-MODEL = "gemma3"
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+log = logging.getLogger(__name__)
+
+DEFAULT_URL = os.getenv("UI_URL", "ws://localhost:7777/ws/worker")
+DEFAULT_MODEL = os.getenv("MODEL", "gemma3")
+MODEL = DEFAULT_MODEL  # overridden by --model argument
 
 # Retrieval parameters
 VECTOR_TOP_K = 30  # candidates from vector search
@@ -51,14 +66,40 @@ MAX_CONTEXT_CHARS = 30000  # max chars sent to LLM (fits ~8k tokens)
 
 SYSTEM_PROMPT = """Du är en beslutstödsassistent. Du hjälper till att fatta nya beslut baserat på tidigare beslut som tillhandahålls som kontext.
 
-När du svarar:
+Du kan hantera olika typer av frågor:
+
+**Beslutsstöd** (t.ex. "Hur ska vi hantera detta ärende?"):
 1. Analysera de relevanta tidigare besluten som tillhandahålls som kontext
 2. Identifiera mönster, prejudikat och principer från dessa beslut
 3. Tillämpa dem på den nya situationen
 4. Ge en tydlig rekommendation med motivering
 5. Hänvisa till vilka tidigare beslut som stödjer din rekommendation (referera med filnamn)
 
-Om kontexten inte innehåller relevanta prejudikat, säg det tydligt istället för att gissa. Svara alltid på svenska."""
+**Analytiska frågor** (t.ex. "Hur många dokument handlar om X?", "Vilka dokument nämner Y?"):
+1. Granska den tillhandahållna kontexten noggrant
+2. Räkna eller lista dokument som matchar frågan
+3. Var exakt — ange filnamn för varje träff
+4. Om du fått en textsökning, rapportera exakt antal träffar och vilka dokument som matchade
+
+**Visualiseringar:**
+När det är relevant att visa data grafiskt (t.ex. fördelningar, jämförelser, antal per kategori), inkludera ett diagram med detta exakta format:
+
+```chart
+{
+  "title": "Diagramtitel",
+  "type": "bar",
+  "data": [
+    {"label": "Kategori A", "value": 10},
+    {"label": "Kategori B", "value": 20}
+  ],
+  "x_label": "X-axel",
+  "y_label": "Y-axel"
+}
+```
+
+Tillgängliga diagramtyper: bar, pie, line, scatter. Använd diagram framför allt vid analytiska frågor om antal, fördelningar eller jämförelser. Inkludera alltid en textuell sammanfattning utöver diagrammet.
+
+Om kontexten inte innehåller relevanta resultat, säg det tydligt istället för att gissa. Svara alltid på svenska."""
 
 PDF_SYSTEM_PROMPT = """Du är en beslutstödsassistent. Du analyserar ett nytt ärende (en uppladdad PDF) och jämför det med tidigare beslut som tillhandahålls som kontext.
 
@@ -73,20 +114,20 @@ När du svarar:
 Om kontexten inte innehåller relevanta prejudikat, säg det tydligt istället för att gissa. Svara alltid på svenska."""
 
 # Load models at startup
-print("Loading embedding model...")
+log.info("Loading embedding model...")
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-print("Loading re-ranking model...")
+log.info("Loading re-ranking model...")
 rerank_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-print("Loading BM25 index...")
+log.info("Loading BM25 index...")
 bm25_data = None
 if BM25_PATH.exists():
     with open(BM25_PATH, "rb") as f:
         bm25_data = pickle.load(f)
-    print(f"  BM25: {len(bm25_data['corpus'])} documents")
+    log.info("  BM25: %d documents", len(bm25_data['corpus']))
 else:
-    print("  BM25 index missing — run ingest.py first for hybrid search.")
+    log.warning("  BM25 index missing — run ingest.py first for hybrid search.")
 
 # Load full texts for expanded context
 FULL_TEXTS_PATH = Path(__file__).parent / "full_texts.json"
@@ -94,9 +135,9 @@ full_texts: dict[str, str] = {}
 if FULL_TEXTS_PATH.exists():
     with open(FULL_TEXTS_PATH) as f:
         full_texts = json.load(f)
-    print(f"  Full texts: {len(full_texts)} documents")
+    log.info("  Full texts: %d documents", len(full_texts))
 
-print("All models loaded.")
+log.info("All models loaded.")
 
 
 def get_collection():
@@ -259,6 +300,109 @@ def expand_context(hits: list[dict]) -> str:
     return "\n\n---\n\n".join(context_parts)
 
 
+def text_search(terms: list[str], case_sensitive: bool = False) -> list[dict]:
+    """Search for exact substrings across all full document texts."""
+    results = []
+    for filename, text in full_texts.items():
+        search_text = text if case_sensitive else text.lower()
+        matches = {}
+        for term in terms:
+            search_term = term if case_sensitive else term.lower()
+            count = search_text.count(search_term)
+            if count > 0:
+                matches[term] = count
+        if matches:
+            # Extract a short snippet around the first match
+            first_term = list(matches.keys())[0]
+            st = first_term if case_sensitive else first_term.lower()
+            idx = search_text.find(st)
+            start = max(0, idx - 100)
+            end = min(len(text), idx + len(first_term) + 200)
+            snippet = text[start:end].replace("\n", " ").strip()
+            results.append({
+                "filename": filename,
+                "matches": matches,
+                "total_matches": sum(matches.values()),
+                "snippet": f"...{snippet}...",
+            })
+    results.sort(key=lambda x: x["total_matches"], reverse=True)
+    return results
+
+
+def retrieve_broad(query: str, top_k: int = 50) -> tuple[str, int]:
+    """Broader retrieval for aggregate/analytical questions."""
+    vector_hits = vector_search(query, top_k=min(top_k, 100))
+    bm25_hits = bm25_search(query, top_k=min(top_k, 100))
+    candidates = merge_and_deduplicate(vector_hits, bm25_hits)
+
+    if not candidates:
+        return "", 0
+
+    ranked = rerank(query, candidates, top_k=top_k)
+    if not ranked:
+        return "", 0
+
+    # For analytical questions, list all matching documents with brief excerpts
+    seen_sources = set()
+    context_parts = []
+    total_chars = 0
+
+    for hit in ranked:
+        filename = hit["metadata"].get("filename", "okänd")
+        if filename in seen_sources:
+            continue
+        seen_sources.add(filename)
+        score = hit.get("rerank_score", hit.get("score", 0))
+        excerpt = hit["text"][:300].replace("\n", " ")
+        entry = f"### {filename} (relevans: {score:.2f})\n{excerpt}..."
+        if total_chars + len(entry) > MAX_CONTEXT_CHARS:
+            break
+        context_parts.append(entry)
+        total_chars += len(entry)
+
+    context = "\n\n".join(context_parts)
+    return context, len(seen_sources)
+
+
+import re as _re
+
+# Patterns that indicate analytical/aggregate questions
+_ANALYTICAL_PATTERNS = [
+    r"hur många",
+    r"hur\s+stor\s+andel",
+    r"vilka dokument",
+    r"vilka beslut",
+    r"lista alla",
+    r"räkna",
+    r"antal",
+    r"finns det.*som handlar om",
+    r"finns det.*som nämner",
+    r"finns det.*som innehåller",
+    r"som handlar om",
+    r"som nämner",
+    r"som innehåller",
+    r"sök efter",
+    r"hitta alla",
+    r"innehåller.*strängen",
+    r"innehåller.*ordet",
+    r"innehåller.*texten",
+]
+
+
+def _is_analytical(question: str) -> bool:
+    q = question.lower()
+    return any(_re.search(p, q) for p in _ANALYTICAL_PATTERNS)
+
+
+def _extract_search_terms(question: str) -> list[str]:
+    """Extract quoted strings or key nouns as text search terms."""
+    # First try quoted strings: "katter" or 'katter'
+    quoted = _re.findall(r'["\u201c\u201d\'](.*?)["\u201c\u201d\']', question)
+    if quoted:
+        return quoted
+    return []
+
+
 def retrieve(query: str) -> tuple[str, int]:
     """Full retrieval pipeline: hybrid search -> rerank -> expand context."""
     # Step 1: Hybrid search
@@ -286,25 +430,57 @@ def retrieve(query: str) -> tuple[str, int]:
 
 def process_question(question: str):
     """Generator yielding (num_sources, token) tuples."""
-    context, num_sources = retrieve(question)
+    analytical = _is_analytical(question)
+    search_terms = _extract_search_terms(question)
 
-    if not context:
+    # Build text search results if we have explicit search terms
+    text_search_context = ""
+    if search_terms:
+        ts_results = text_search(search_terms)
+        if ts_results:
+            parts = [f"**Textsökning för {search_terms}:** {len(ts_results)} dokument matchade.\n"]
+            for r in ts_results[:50]:
+                match_info = ", ".join(f'"{t}": {c} träffar' for t, c in r["matches"].items())
+                parts.append(f"- **{r['filename']}** ({match_info})\n  Utdrag: {r['snippet']}")
+            text_search_context = "\n".join(parts)
+        else:
+            text_search_context = f"**Textsökning för {search_terms}:** Inga dokument matchade."
+
+    # Retrieve with broader scope for analytical questions
+    if analytical:
+        context, num_sources = retrieve_broad(question)
+    else:
+        context, num_sources = retrieve(question)
+
+    if not context and not text_search_context:
         yield num_sources, "Inga relevanta beslut hittades i databasen."
         return
 
-    user_prompt = f"""## Tidigare beslut (Kontext)
+    # Build prompt
+    context_sections = []
+    if text_search_context:
+        context_sections.append(f"## Textsökningsresultat\n\n{text_search_context}")
+    if context:
+        context_sections.append(f"## Tidigare beslut (Kontext)\n\n{context}")
 
-{context}
+    combined_context = "\n\n---\n\n".join(context_sections)
 
-## Ny situation
+    if analytical:
+        instruction = "Baserat på informationen ovan, svara på frågan. Var exakt med antal och filnamn."
+    else:
+        instruction = "Baserat på tidigare beslut ovan, ge din analys och rekommendation."
+
+    user_prompt = f"""{combined_context}
+
+## Fråga
 
 {question}
 
-## Din rekommendation
+## Ditt svar
 
-Baserat på tidigare beslut ovan, ge din analys och rekommendation."""
+{instruction}"""
 
-    print(question)
+    log.info("[%s] %s", "analytical" if analytical else "standard", question)
 
     response = ollama.chat(
         model=MODEL,
@@ -368,7 +544,7 @@ def process_pdf(pdf_base64: str):
 
 Analysera det nya ärendet ovan och ge ett utlåtande baserat på tidigare beslut."""
 
-    print(user_prompt)
+    log.debug("PDF prompt: %s", user_prompt[:200])
 
     response = ollama.chat(
         model=MODEL,
@@ -448,9 +624,9 @@ async def connect(url: str):
     """Connect to UI and process jobs forever."""
     while True:
         try:
-            print(f"Connecting to {url}...")
+            log.info("Connecting to %s...", url)
             async with websockets.connect(url, max_size=100_000_000) as ws:
-                print(f"Connected to {url}")
+                log.info("Connected to %s", url)
                 await send_status(ws)
 
                 async for raw in ws:
@@ -458,15 +634,45 @@ async def connect(url: str):
                     await handle_job(ws, msg)
 
         except (ConnectionRefusedError, OSError) as ex:
-            print(f"Connection failed: {ex}. Retrying in 5s...")
+            log.warning("Connection failed: %s. Retrying in 5s...", ex)
         except websockets.ConnectionClosed:
-            print("Connection closed. Reconnecting in 2s...")
+            log.warning("Connection closed. Reconnecting in 2s...")
             await asyncio.sleep(2)
             continue
 
         await asyncio.sleep(5)
 
 
+def download_models():
+    """Download embedding and re-ranking models for offline use."""
+    # Temporarily allow network access
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
+    log.info("Downloading embedding model: all-MiniLM-L6-v2...")
+    SentenceTransformer("all-MiniLM-L6-v2")
+    log.info("Downloading re-ranking model: cross-encoder/ms-marco-MiniLM-L-6-v2...")
+    CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    log.info("All models downloaded.")
+
+
 if __name__ == "__main__":
-    url = sys.argv[1] if len(sys.argv) > 1 else UI_URL
-    asyncio.run(connect(url))
+    parser = argparse.ArgumentParser(description="Worker for decision support RAG system")
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"WebSocket URL (default: {DEFAULT_URL})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name (default: {DEFAULT_MODEL})")
+    parser.add_argument("--download", action="store_true", help="Download models for offline use and exit")
+    parser.add_argument("--log-file", metavar="PATH", help="Log to file in addition to stderr")
+    args = parser.parse_args()
+
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file)
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logging.getLogger().addHandler(file_handler)
+
+    if args.download:
+        download_models()
+        sys.exit(0)
+
+    MODEL = args.model
+    log.info("Using model: %s", MODEL)
+    asyncio.run(connect(args.url))

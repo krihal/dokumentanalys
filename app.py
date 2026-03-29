@@ -4,14 +4,172 @@ import asyncio
 import base64
 import json
 import os
+import re
 import uuid
 
 from dotenv import load_dotenv
 from nicegui import app, ui
 
+import plotly.graph_objects as go
+
 load_dotenv()
 
 APP_PASSWORD = os.getenv("APP_PASSWORD", "LetMeIn!")
+
+_CHART_RE = re.compile(r"```chart\s*\n(.*?)```", re.DOTALL)
+
+
+def parse_chart_segments(text: str) -> list[tuple[str, str]]:
+    """Split text into ('md', markdown) and ('chart', json_str) segments."""
+    segments = []
+    last_end = 0
+    for m in _CHART_RE.finditer(text):
+        if m.start() > last_end:
+            segments.append(("md", text[last_end : m.start()]))
+        segments.append(("chart", m.group(1).strip()))
+        last_end = m.end()
+    if last_end < len(text):
+        segments.append(("md", text[last_end:]))
+    return segments
+
+
+def build_plotly_figure(spec: dict, dark: bool = False) -> go.Figure:
+    """Convert a simplified chart spec to a Plotly figure."""
+    chart_type = spec.get("type", "bar")
+    title = spec.get("title", "")
+    data = spec.get("data", [])
+    x_label = spec.get("x_label", "")
+    y_label = spec.get("y_label", "")
+
+    labels = [d.get("label", "") for d in data]
+    values = [d.get("value", 0) for d in data]
+
+    # Theme colors
+    fg = "#ffffff" if dark else "#000000"
+    bg = "#1a1a1a" if dark else "#ffffff"
+    grid = "#444444" if dark else "#e0e0e0"
+    # Palette that works on both light and dark backgrounds
+    palette = [
+        "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
+        "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
+    ]
+
+    if chart_type == "pie":
+        fig = go.Figure(data=[go.Pie(
+            labels=labels,
+            values=values,
+            marker=dict(colors=palette[:len(values)]),
+            textfont=dict(color=fg),
+            outsidetextfont=dict(color=fg),
+        )])
+    elif chart_type == "line":
+        fig = go.Figure(
+            data=[go.Scatter(
+                x=labels, y=values, mode="lines+markers",
+                line=dict(color=palette[0]),
+                marker=dict(color=palette[0]),
+            )]
+        )
+    elif chart_type == "scatter":
+        fig = go.Figure(
+            data=[go.Scatter(
+                x=labels, y=values, mode="markers",
+                marker=dict(color=palette[0]),
+            )]
+        )
+    else:  # bar
+        fig = go.Figure(data=[go.Bar(
+            x=labels, y=values,
+            marker=dict(color=palette[:len(values)]),
+        )])
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(color=fg)),
+        xaxis_title=dict(text=x_label, font=dict(color=fg)),
+        yaxis_title=dict(text=y_label, font=dict(color=fg)),
+        xaxis=dict(
+            color=fg,
+            gridcolor=grid,
+            linecolor=grid,
+            zerolinecolor=grid,
+        ),
+        yaxis=dict(
+            color=fg,
+            gridcolor=grid,
+            linecolor=grid,
+            zerolinecolor=grid,
+        ),
+        legend=dict(font=dict(color=fg)),
+        paper_bgcolor=bg,
+        plot_bgcolor=bg,
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+    return fig
+
+
+# JS snippet injected once per page to watch for dark-mode changes and
+# re-theme all Plotly charts automatically.
+_PLOTLY_THEME_JS = """
+<script>
+(function() {
+    function isDark() {
+        return document.body.classList.contains('body--dark');
+    }
+
+    function themeCharts() {
+        var dark = isDark();
+        var fg = dark ? '#ffffff' : '#000000';
+        var bg = dark ? '#1a1a1a' : '#ffffff';
+        var grid = dark ? '#444444' : '#e0e0e0';
+        document.querySelectorAll('.js-plotly-plot').forEach(function(el) {
+            Plotly.relayout(el, {
+                'paper_bgcolor': bg,
+                'plot_bgcolor': bg,
+                'title.font.color': fg,
+                'xaxis.color': fg,
+                'xaxis.gridcolor': grid,
+                'xaxis.linecolor': grid,
+                'xaxis.zerolinecolor': grid,
+                'yaxis.color': fg,
+                'yaxis.gridcolor': grid,
+                'yaxis.linecolor': grid,
+                'yaxis.zerolinecolor': grid,
+                'legend.font.color': fg,
+                'xaxis.title.font.color': fg,
+                'yaxis.title.font.color': fg,
+            });
+            // Re-style trace text colors per chart type
+            var data = el.data;
+            if (data && data[0]) {
+                if (data[0].type === 'pie') {
+                    Plotly.restyle(el, {
+                        'textfont.color': fg,
+                        'outsidetextfont.color': fg
+                    });
+                } else if (data[0].type === 'bar') {
+                    Plotly.restyle(el, {
+                        'textfont.color': fg,
+                        'marker.line.color': bg,
+                        'marker.line.width': 1
+                    });
+                }
+            }
+        });
+    }
+
+    // Watch for Quasar dark-mode class changes on <body>
+    var obs = new MutationObserver(function(mutations) {
+        for (var m of mutations) {
+            if (m.attributeName === 'class') { themeCharts(); break; }
+        }
+    });
+    obs.observe(document.body, {attributes: true});
+
+    // Also run on load after a short delay (charts may render after DOM ready)
+    setTimeout(themeCharts, 500);
+})();
+</script>
+"""
 
 
 def check_auth(password: str) -> bool:
@@ -22,6 +180,10 @@ def check_auth(password: str) -> bool:
 worker_ws = None  # Active worker WebSocket connection
 worker_status_info: dict | None = None  # Latest status from worker
 pending_jobs: dict[str, asyncio.Queue] = {}  # job_id -> queue of messages
+
+# Server-side buffer for in-progress jobs so page reloads can resume
+# job_id -> {"text": str, "done": bool, "error": str|None, "num_sources": int, "subscribers": set[asyncio.Event]}
+active_jobs: dict[str, dict] = {}
 
 
 @app.get("/ws/worker")
@@ -84,6 +246,74 @@ async def send_job(job: dict):
         yield {"type": "error", "id": job_id, "message": "Timeout — inget svar från worker."}
     finally:
         pending_jobs.pop(job_id, None)
+
+
+def _ensure_job_buffer(job_id: str) -> dict:
+    """Create the buffer entry if it doesn't exist yet."""
+    if job_id not in active_jobs:
+        active_jobs[job_id] = {
+            "text": "", "done": False, "error": None, "num_sources": 0, "events": set(),
+        }
+    return active_jobs[job_id]
+
+
+async def start_buffered_job(job: dict):
+    """Start a job and buffer results server-side so page reloads can resume."""
+    job_id = job["id"]
+    buf = _ensure_job_buffer(job_id)
+
+    async for msg in send_job(job):
+        if msg["type"] == "chunk":
+            buf["text"] += msg.get("text", "")
+            buf["num_sources"] = msg.get("num_sources", 0)
+        elif msg["type"] == "error":
+            buf["error"] = msg.get("message", "Okänt fel")
+            buf["done"] = True
+        elif msg["type"] == "done":
+            buf["done"] = True
+        # Notify all subscribers
+        for event in buf["events"]:
+            event.set()
+
+
+async def follow_job(job_id: str):
+    """Yield updates from a buffered job (works for both new and resumed jobs)."""
+    buf = active_jobs.get(job_id)
+    if not buf:
+        return
+
+    last_len = 0
+    event = asyncio.Event()
+    buf["events"].add(event)
+
+    try:
+        while True:
+            current_text = buf["text"]
+            if len(current_text) > last_len:
+                yield {
+                    "type": "chunk",
+                    "text": current_text,
+                    "num_sources": buf["num_sources"],
+                }
+                last_len = len(current_text)
+
+            if buf["done"]:
+                if buf["error"]:
+                    yield {"type": "error", "message": buf["error"]}
+                else:
+                    yield {"type": "done"}
+                break
+
+            event.clear()
+            try:
+                await asyncio.wait_for(event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                yield {"type": "error", "message": "Timeout — inget svar från worker."}
+                break
+    finally:
+        buf["events"].discard(event)
+        if buf["done"]:
+            active_jobs.pop(job_id, None)
 
 
 # --- UI ---
@@ -328,8 +558,10 @@ def main_page():
     if not app.storage.user.get("authenticated"):
         return ui.navigate.to("/login")
 
-    ui.dark_mode().auto()
+    dark = ui.dark_mode()
+    dark.auto()
     ui.add_head_html(f"<style>{VR_STYLE}</style>")
+    ui.add_body_html(_PLOTLY_THEME_JS)
 
     # --- White header with black VR logo ---
     with ui.header().classes("items-center justify-between").style(
@@ -366,16 +598,22 @@ def main_page():
                 ),
             ).props('outline round size=sm color="black"').tooltip("Logga ut")
 
+    # --- Restore previous session ---
+    saved_question = app.storage.user.get("last_question", "")
+    saved_result = app.storage.user.get("last_result", "")
+    active_job_id = app.storage.user.get("active_job_id")
+
     # --- Main content ---
     with ui.column().classes("w-full max-w-4xl mx-auto q-mt-lg q-px-md"):
         with ui.card().classes("w-full vr-card q-pa-lg"):
-            ui.label("Ställ en fråga baserat på tidigare beslut").classes(
+            ui.label("Ställ en fråga baserat på tidigare yttranden och beslut.").classes(
                 "text-subtitle1 q-mb-md"
             ).style("font-weight: 600;")
 
             question_input = ui.textarea(
-                label="Din fråga",
+                label="Din fråga:",
                 placeholder="Beskriv den nya situationen eller ställ en fråga...",
+                value=saved_question,
             ).classes("w-full")
 
             # --- Action row: file icon (left) + Analyse button (right) ---
@@ -384,8 +622,7 @@ def main_page():
 
                 async def handle_upload(e):
                     pdf_file_label.set_text(f"PDF: {e.file.name}")
-                    result_area.set_content("")
-                    result_area.set_visibility(False)
+                    _clear_result()
                     progress_row.set_visibility(True)
                     result_step.set_text("Steg 1/3 — Läser PDF")
                     result_detail.set_text(f"Laddar upp {e.file.name}...")
@@ -404,22 +641,11 @@ def main_page():
                             "pdf_base64": encoded,
                         }
 
-                        full = ""
-                        async for msg in send_job(job):
-                            if msg["type"] == "chunk":
-                                num_sources = msg.get("num_sources", 0)
-                                result_step.set_text("Steg 3/3 — Genererar svar")
-                                result_detail.set_text(
-                                    f"Hittade {num_sources} relevanta dokument. Skriver svar..."
-                                )
-                                full += msg["text"]
-                                result_area.set_content(full)
-                                result_area.set_visibility(True)
-                            elif msg["type"] == "error":
-                                result_area.set_content(f"**Fel:** {msg['message']}")
-                                result_area.set_visibility(True)
-                            elif msg["type"] == "done":
-                                progress_row.set_visibility(False)
+                        app.storage.user["active_job_id"] = job["id"]
+                        app.storage.user["last_question"] = f"[PDF: {e.file.name}]"
+                        _ensure_job_buffer(job["id"])
+                        asyncio.create_task(start_buffered_job(job))
+                        await _follow_and_display(job["id"], f"[PDF: {e.file.name}]")
                     finally:
                         progress_row.set_visibility(False)
                         analyse_btn.enable()
@@ -447,8 +673,7 @@ def main_page():
                         ui.notify("Skriv en fråga först.", type="warning")
                         return
 
-                    result_area.set_content("")
-                    result_area.set_visibility(False)
+                    _clear_result()
                     progress_row.set_visibility(True)
                     result_step.set_text("Steg 1/3 — Skickar fråga")
                     result_detail.set_text("Väntar på analys...")
@@ -461,22 +686,11 @@ def main_page():
                             "question": question,
                         }
 
-                        full = ""
-                        async for msg in send_job(job):
-                            if msg["type"] == "chunk":
-                                num_sources = msg.get("num_sources", 0)
-                                result_step.set_text("Steg 3/3 — Genererar svar")
-                                result_detail.set_text(
-                                    f"Hittade {num_sources} relevanta dokument. Skriver svar..."
-                                )
-                                full += msg["text"]
-                                result_area.set_content(full)
-                                result_area.set_visibility(True)
-                            elif msg["type"] == "error":
-                                result_area.set_content(f"**Fel:** {msg['message']}")
-                                result_area.set_visibility(True)
-                            elif msg["type"] == "done":
-                                progress_row.set_visibility(False)
+                        app.storage.user["active_job_id"] = job["id"]
+                        app.storage.user["last_question"] = question
+                        _ensure_job_buffer(job["id"])
+                        asyncio.create_task(start_buffered_job(job))
+                        await _follow_and_display(job["id"], question)
                     finally:
                         progress_row.set_visibility(False)
                         analyse_btn.enable()
@@ -486,11 +700,17 @@ def main_page():
                 ).props('outline no-caps color="black"').classes("vr-btn")
 
             # Cmd+Enter (Mac) / Ctrl+Enter (Win/Linux) to submit
-            question_input.on(
-                "keydown",
-                handle_question,
-                js_handler="(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); return true; } return false; }",
-            )
+            ui.add_body_html(f"""<script>
+            document.addEventListener('keydown', function(e) {{
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {{
+                    e.preventDefault();
+                    var btn = document.getElementById('analyse-btn');
+                    if (btn) btn.click();
+                }}
+            }});
+            </script>""")
+            analyse_btn._props['id'] = 'analyse-btn'
+            analyse_btn.update()
 
         # --- Progress indicator ---
         with ui.row().classes("w-full items-center q-mt-md vr-progress") as progress_row:
@@ -500,9 +720,128 @@ def main_page():
                 result_detail = ui.label("").classes("vr-progress-text")
         progress_row.set_visibility(False)
 
-        # --- Result area ---
-        result_area = ui.markdown("").classes("w-full q-mt-md vr-result")
-        result_area.set_visibility(False)
+        # --- Result area: single card holding streaming markdown OR final mixed content ---
+        with ui.card().classes("w-full q-mt-md vr-card vr-result") as result_card:
+            result_stream = ui.markdown("").classes("w-full")
+            result_stream.set_visibility(False)
+            result_container = ui.column().classes("w-full gap-4")
+            result_container.set_visibility(False)
+        result_card.set_visibility(False)
+
+        def _clear_result():
+            """Hide both result views and clear content."""
+            result_stream.set_content("")
+            result_stream.set_visibility(False)
+            result_container.clear()
+            result_container.set_visibility(False)
+            result_card.set_visibility(False)
+
+        def _is_dark() -> bool:
+            return dark.value is True or (
+                dark.value is None
+                and app.storage.browser.get("dark_mode")
+            )
+
+        def _render_final(text: str):
+            """Parse text for chart blocks and render mixed markdown + Plotly."""
+            result_stream.set_visibility(False)
+            result_container.clear()
+            segments = parse_chart_segments(text)
+            has_charts = any(s[0] == "chart" for s in segments)
+
+            if not has_charts:
+                # No charts — just show as markdown in the card
+                result_stream.set_content(text)
+                result_stream.set_visibility(True)
+                result_container.set_visibility(False)
+                result_card.set_visibility(True)
+                return
+
+            is_dark = _is_dark()
+            with result_container:
+                for seg_type, content in segments:
+                    if seg_type == "md" and content.strip():
+                        ui.markdown(content).classes("w-full")
+                    elif seg_type == "chart":
+                        try:
+                            spec = json.loads(content)
+                            fig = build_plotly_figure(spec, dark=is_dark)
+                            ui.plotly(fig).classes("w-full")
+                        except (json.JSONDecodeError, KeyError):
+                            ui.markdown(f"```\n{content}\n```").classes(
+                                "w-full"
+                            )
+            result_container.set_visibility(True)
+            result_card.set_visibility(True)
+            # Re-theme charts after render based on actual browser state
+            ui.run_javascript(
+                "setTimeout(function(){"
+                "var d=document.body.classList.contains('body--dark');"
+                "var fg=d?'#ffffff':'#000000';"
+                "var bg=d?'#1a1a1a':'#ffffff';"
+                "var g=d?'#444444':'#e0e0e0';"
+                "document.querySelectorAll('.js-plotly-plot').forEach(function(el){"
+                "Plotly.relayout(el,{"
+                "'paper_bgcolor':bg,'plot_bgcolor':bg,"
+                "'title.font.color':fg,"
+                "'xaxis.color':fg,'xaxis.gridcolor':g,'xaxis.linecolor':g,'xaxis.zerolinecolor':g,"
+                "'yaxis.color':fg,'yaxis.gridcolor':g,'yaxis.linecolor':g,'yaxis.zerolinecolor':g,"
+                "'legend.font.color':fg,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg"
+                "});"
+                "if(el.data&&el.data[0]){"
+                "if(el.data[0].type==='pie')Plotly.restyle(el,{'textfont.color':fg,'outsidetextfont.color':fg});"
+                "else if(el.data[0].type==='bar')Plotly.restyle(el,{'textfont.color':fg,'marker.line.color':bg,'marker.line.width':1});"
+                "}"
+                "});},200);"
+            )
+
+        async def _follow_and_display(job_id: str, question_label: str):
+            """Stream results from a buffered job into the UI."""
+            full_text = ""
+            async for msg in follow_job(job_id):
+                if msg["type"] == "chunk":
+                    num_sources = msg.get("num_sources", 0)
+                    result_step.set_text("Steg 3/3 — Genererar svar")
+                    result_detail.set_text(
+                        f"Hittade {num_sources} relevanta dokument. Skriver svar..."
+                    )
+                    full_text = msg["text"]
+                    result_stream.set_content(full_text)
+                    result_stream.set_visibility(True)
+                    result_card.set_visibility(True)
+                elif msg["type"] == "error":
+                    result_stream.set_content(f"**Fel:** {msg['message']}")
+                    result_stream.set_visibility(True)
+                    result_card.set_visibility(True)
+                elif msg["type"] == "done":
+                    _render_final(full_text)
+                    app.storage.user["last_result"] = full_text
+                    app.storage.user.pop("active_job_id", None)
+                    progress_row.set_visibility(False)
+
+        async def _resume_job():
+            try:
+                await _follow_and_display(active_job_id, saved_question)
+            finally:
+                progress_row.set_visibility(False)
+                analyse_btn.enable()
+
+        # --- Resume in-progress job or restore last result ---
+        if active_job_id and active_job_id in active_jobs:
+            progress_row.set_visibility(True)
+            result_step.set_text("Återansluter...")
+            result_detail.set_text("Hämtar pågående analys...")
+            analyse_btn.disable()
+            asyncio.create_task(_resume_job())
+        elif saved_result:
+            _render_final(saved_result)
 
 
-ui.run(title="Beslutstödssystem", port=7777, storage_secret="beslut-rag-secret")
+VR_FAVICON = "https://www.vr.se/images/18.781fb755163605b8cd26282f/1526903371336/VR_symbol.svg"
+
+ui.run(
+    title="Beslutstödssystem",
+    port=7777,
+    storage_secret="beslut-rag-secret",
+    favicon=VR_FAVICON,
+)
