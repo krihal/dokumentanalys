@@ -7,18 +7,18 @@ import chromadb
 from dotenv import load_dotenv
 
 load_dotenv()
-import ollama
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from sentence_transformers import SentenceTransformer
 
-from ingest import CHROMA_DIR, COLLECTION_NAME
+from ingest import CHROMA_DIR, COLLECTION_NAME, embed_query, load_embed_model
+from worker import DEFAULT_MODEL, llm_chat_stream
 
 console = Console()
 
-MODEL = "llama3.1:latest"
+MODEL = DEFAULT_MODEL
 TOP_K = 10  # number of chunks to retrieve
 
 SYSTEM_PROMPT = """Du är en beslutstödsassistent. Du hjälper till att fatta nya beslut baserat på tidigare beslut som tillhandahålls som kontext.
@@ -43,7 +43,7 @@ def retrieve(
     query: str, collection, model: SentenceTransformer, top_k: int = TOP_K
 ) -> str:
     """Retrieve relevant chunks for a query."""
-    query_embedding = model.encode([query]).tolist()
+    query_embedding = embed_query(model, query)
 
     results = collection.query(
         query_embeddings=query_embedding,
@@ -75,7 +75,7 @@ def retrieve(
 def ask(question: str):
     """Ask a question and get a decision recommendation."""
     console.print("Laddar inbäddningsmodell...")
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    embed_model = load_embed_model()
 
     try:
         collection = get_collection()
@@ -105,20 +105,11 @@ Baserat på tidigare beslut ovan, ge din analys och rekommendation."""
     # Query local LLM
     console.print(f"\n[dim]Frågar {MODEL}...[/dim]\n")
 
-    response = ollama.chat(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        stream=True,
-    )
-
-    # Stream the response
-    full_response = ""
-    for chunk in response:
-        token = chunk["message"]["content"]
-        full_response += token
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    for token in llm_chat_stream(MODEL, messages):
         console.print(token, end="")
 
     console.print()  # newline after streaming
@@ -137,7 +128,7 @@ def interactive():
 
     # Load models once
     console.print("Laddar inbäddningsmodell...")
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    embed_model = load_embed_model()
 
     try:
         collection = get_collection()
@@ -173,17 +164,12 @@ Baserat på tidigare beslut ovan, ge din analys och rekommendation."""
 
         console.print(f"\n[dim]Frågar {MODEL}...[/dim]\n")
 
-        response = ollama.chat(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=True,
-        )
-
-        for chunk in response:
-            console.print(chunk["message"]["content"], end="")
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        for token in llm_chat_stream(MODEL, messages):
+            console.print(token, end="")
         console.print("\n")
 
 

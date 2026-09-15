@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import uuid
 
 from dotenv import load_dotenv
@@ -14,7 +15,44 @@ import plotly.graph_objects as go
 
 load_dotenv()
 
-APP_PASSWORD = os.getenv("APP_PASSWORD", "LetMeIn!")
+# Secrets come from the environment (.env). Refuse to start without them so
+# a deployment never runs with a known default password or session secret.
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+STORAGE_SECRET = os.getenv("STORAGE_SECRET", "")
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
+_missing = [n for n, v in (("APP_PASSWORD", APP_PASSWORD), ("STORAGE_SECRET", STORAGE_SECRET), ("WORKER_TOKEN", WORKER_TOKEN)) if not v]
+if _missing:
+    raise SystemExit(
+        f"Saknade miljövariabler: {', '.join(_missing)}. "
+        "Sätt dem i .env (se .env.example), t.ex. med: openssl rand -hex 24"
+    )
+
+# Fallback list, used only until a worker reports what its LLM backend
+# actually serves. Labels here also decorate matching ids from the worker.
+AVAILABLE_MODELS = [
+    {
+        "value": "gemma4:26b",
+        "label": "Gemma 4 26B MoE — snabb vid långa kontexter, hög kvalitet",
+    },
+    {"value": "gemma4:31b", "label": "Gemma 4 31B — bäst kvalitet, långsammare"},
+    {"value": "gemma4:12b", "label": "Gemma 4 12B — snabbast, kompakt"},
+    {
+        "value": "qwen2.5:72b",
+        "label": "Qwen 2.5 72B — stark flerspråkig, bra på svenska",
+    },
+    {"value": "llama3.3:70b", "label": "Llama 3.3 70B — hög kvalitet, 128K kontext"},
+    {"value": "mistral-small:24b", "label": "Mistral Small 24B — snabb, bra kvalitet"},
+]
+DEFAULT_MODEL = os.getenv("MODEL", "gemma4:26b")
+_MODEL_LABELS = {m["value"]: m["label"] for m in AVAILABLE_MODELS}
+
+
+def model_options() -> dict[str, str]:
+    """Dropdown options: models the connected worker's backend lists, else the fallback."""
+    reported = (worker_status_info or {}).get("models") or []
+    if reported:
+        return {m: _MODEL_LABELS.get(m, m) for m in reported}
+    return dict(_MODEL_LABELS)
 
 _CHART_RE = re.compile(r"```chart\s*\n(.*?)```", re.DOTALL)
 
@@ -50,38 +88,63 @@ def build_plotly_figure(spec: dict, dark: bool = False) -> go.Figure:
     grid = "#444444" if dark else "#e0e0e0"
     # Palette that works on both light and dark backgrounds
     palette = [
-        "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
-        "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
+        "#636EFA",
+        "#EF553B",
+        "#00CC96",
+        "#AB63FA",
+        "#FFA15A",
+        "#19D3F3",
+        "#FF6692",
+        "#B6E880",
+        "#FF97FF",
+        "#FECB52",
     ]
 
     if chart_type == "pie":
-        fig = go.Figure(data=[go.Pie(
-            labels=labels,
-            values=values,
-            marker=dict(colors=palette[:len(values)]),
-            textfont=dict(color=fg),
-            outsidetextfont=dict(color=fg),
-        )])
+        fig = go.Figure(
+            data=[
+                go.Pie(
+                    labels=labels,
+                    values=values,
+                    marker=dict(colors=palette[: len(values)]),
+                    textfont=dict(color=fg),
+                    outsidetextfont=dict(color=fg),
+                )
+            ]
+        )
     elif chart_type == "line":
         fig = go.Figure(
-            data=[go.Scatter(
-                x=labels, y=values, mode="lines+markers",
-                line=dict(color=palette[0]),
-                marker=dict(color=palette[0]),
-            )]
+            data=[
+                go.Scatter(
+                    x=labels,
+                    y=values,
+                    mode="lines+markers",
+                    line=dict(color=palette[0]),
+                    marker=dict(color=palette[0]),
+                )
+            ]
         )
     elif chart_type == "scatter":
         fig = go.Figure(
-            data=[go.Scatter(
-                x=labels, y=values, mode="markers",
-                marker=dict(color=palette[0]),
-            )]
+            data=[
+                go.Scatter(
+                    x=labels,
+                    y=values,
+                    mode="markers",
+                    marker=dict(color=palette[0]),
+                )
+            ]
         )
     else:  # bar
-        fig = go.Figure(data=[go.Bar(
-            x=labels, y=values,
-            marker=dict(color=palette[:len(values)]),
-        )])
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=labels,
+                    y=values,
+                    marker=dict(color=palette[: len(values)]),
+                )
+            ]
+        )
 
     fig.update_layout(
         title=dict(text=title, font=dict(color=fg)),
@@ -175,6 +238,7 @@ _PLOTLY_THEME_JS = """
 def check_auth(password: str) -> bool:
     return password == APP_PASSWORD
 
+
 # --- Worker connection state ---
 
 worker_ws = None  # Active worker WebSocket connection
@@ -184,6 +248,7 @@ pending_jobs: dict[str, asyncio.Queue] = {}  # job_id -> queue of messages
 # Server-side buffer for in-progress jobs so page reloads can resume
 # job_id -> {"text": str, "done": bool, "error": str|None, "num_sources": int, "subscribers": set[asyncio.Event]}
 active_jobs: dict[str, dict] = {}
+JOB_BUFFER_TTL = 600  # seconds a finished job stays resumable after the last update
 
 
 @app.get("/ws/worker")
@@ -197,10 +262,19 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 @app.websocket("/ws/worker")
 async def worker_endpoint(ws: WebSocket):
-    """WebSocket endpoint that the worker connects to."""
+    """WebSocket endpoint that the worker connects to. Requires the shared WORKER_TOKEN."""
     global worker_ws, worker_status_info
 
+    auth = ws.headers.get("authorization", "")
+    if not secrets.compare_digest(auth, f"Bearer {WORKER_TOKEN}"):
+        client = ws.client.host if ws.client else "?"
+        print(f"Worker connection from {client} rejected: bad token.")
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
+    if worker_ws is not None:
+        print("Replacing previously connected worker.")
     worker_ws = ws
     print("Worker connected.")
 
@@ -220,14 +294,23 @@ async def worker_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("Worker disconnected.")
-        worker_ws = None
-        worker_status_info = None
+    finally:
+        if worker_ws is ws:
+            worker_ws = None
+            worker_status_info = None
+            # Fail every job that was waiting on this worker instead of timing out
+            for job_id, queue in list(pending_jobs.items()):
+                await queue.put({"type": "error", "id": job_id, "message": "Worker kopplade ner mitt i jobbet."})
 
 
 async def send_job(job: dict):
     """Send a job to the worker and yield response messages."""
     if not worker_ws:
-        yield {"type": "error", "id": job.get("id", ""), "message": "Ingen worker ansluten."}
+        yield {
+            "type": "error",
+            "id": job.get("id", ""),
+            "message": "Ingen worker ansluten.",
+        }
         return
 
     job_id = job["id"]
@@ -243,7 +326,11 @@ async def send_job(job: dict):
             if msg["type"] in ("done", "error"):
                 break
     except asyncio.TimeoutError:
-        yield {"type": "error", "id": job_id, "message": "Timeout — inget svar från worker."}
+        yield {
+            "type": "error",
+            "id": job_id,
+            "message": "Timeout — inget svar från worker.",
+        }
     finally:
         pending_jobs.pop(job_id, None)
 
@@ -252,7 +339,11 @@ def _ensure_job_buffer(job_id: str) -> dict:
     """Create the buffer entry if it doesn't exist yet."""
     if job_id not in active_jobs:
         active_jobs[job_id] = {
-            "text": "", "done": False, "error": None, "num_sources": 0, "events": set(),
+            "text": "",
+            "done": False,
+            "error": None,
+            "num_sources": 0,
+            "events": set(),
         }
     return active_jobs[job_id]
 
@@ -274,6 +365,10 @@ async def start_buffered_job(job: dict):
         # Notify all subscribers
         for event in buf["events"]:
             event.set()
+
+    # Drop the buffer after a grace period if nobody is following it
+    # (the result is also kept in the user's storage as last_result).
+    asyncio.get_running_loop().call_later(JOB_BUFFER_TTL, active_jobs.pop, job_id, None)
 
 
 async def follow_job(job_id: str):
@@ -409,6 +504,7 @@ body, .nicegui-content {
     border-radius: 2px;
     box-shadow: none !important;
     background-color: var(--vr-bg) !important;
+    overflow: visible !important;
 }
 
 .vr-login-card {
@@ -452,6 +548,26 @@ body, .nicegui-content {
 
 .vr-icon-btn {
     color: var(--vr-fg) !important;
+}
+
+.vr-model-select .q-field__native,
+.vr-model-select .q-field__input,
+.vr-model-select .q-field__append {
+    color: black !important;
+}
+
+body.body--dark .vr-model-select .q-field__native,
+body.body--dark .vr-model-select .q-field__input,
+body.body--dark .vr-model-select .q-field__append {
+    color: white !important;
+}
+
+.vr-model-select .q-field__control {
+    background: transparent !important;
+}
+
+.vr-model-select .q-field__control:before {
+    border-color: black !important;
 }
 
 .vr-status {
@@ -524,7 +640,6 @@ body.body--dark .vr-logo-light { display: block; }
 """
 
 
-
 @ui.page("/login")
 def login_page():
     ui.dark_mode().auto()
@@ -532,12 +647,14 @@ def login_page():
 
     with ui.column().classes("absolute-center items-center"):
         with ui.card().classes("w-96 vr-card vr-login-card"):
-            ui.label("Logga in").classes(
-                "text-h5 font-bold q-mb-md"
-            ).style("font-family: 'Open Sans', sans-serif;")
-            password_input = ui.input(
-                label="Lösenord", password=True, password_toggle_button=True
-            ).classes("w-full").on("keydown.enter", lambda: do_login())
+            ui.label("Logga in").classes("text-h5 font-bold q-mb-md").style(
+                "font-family: 'Open Sans', sans-serif;"
+            )
+            password_input = (
+                ui.input(label="Lösenord", password=True, password_toggle_button=True)
+                .classes("w-full")
+                .on("keydown.enter", lambda: do_login())
+            )
 
             error_label = ui.label("").classes("text-red q-mt-sm")
 
@@ -579,8 +696,10 @@ def main_page():
 
             def update_status():
                 if worker_status_info:
+                    docs = worker_status_info.get("documents")
+                    chunks = f"{worker_status_info['chunks']:,}".replace(",", " ")
                     status_label.set_text(
-                        f"{worker_status_info['chunks']} textavsnitt i databasen"
+                        f"{chunks} textavsnitt från {docs} dokument" if docs else f"{chunks} textavsnitt i databasen"
                     )
                 elif worker_ws:
                     status_label.set_text("Worker ansluten")
@@ -589,6 +708,13 @@ def main_page():
 
             ui.timer(2.0, update_status)
             update_status()
+
+            def refresh_models():
+                options = model_options()
+                if options != model_select.options:
+                    model_select.set_options(options, value=model_select.value if model_select.value in options else next(iter(options)))
+
+            ui.timer(5.0, refresh_models)
 
             ui.button(
                 icon="logout",
@@ -606,9 +732,10 @@ def main_page():
     # --- Main content ---
     with ui.column().classes("w-full max-w-4xl mx-auto q-mt-lg q-px-md"):
         with ui.card().classes("w-full vr-card q-pa-lg"):
-            ui.label("Ställ en fråga baserat på tidigare yttranden och beslut.").classes(
-                "text-subtitle1 q-mb-md"
-            ).style("font-weight: 600;")
+            ui.label(
+                "Ställ en fråga om Vetenskapsrådets dokument: rapporter, utvärderingar, "
+                "utlysningar, forskningsöversikter, yttranden och beslut."
+            ).classes("text-subtitle1 q-mb-md").style("font-weight: 600;")
 
             question_input = ui.textarea(
                 label="Din fråga:",
@@ -639,6 +766,7 @@ def main_page():
                             "type": "ask-pdf",
                             "id": str(uuid.uuid4()),
                             "pdf_base64": encoded,
+                            "model": model_select.value,
                         }
 
                         app.storage.user["active_job_id"] = job["id"]
@@ -650,22 +778,45 @@ def main_page():
                         progress_row.set_visibility(False)
                         analyse_btn.enable()
 
-                upload = ui.upload(
-                    on_upload=handle_upload,
-                    auto_upload=True,
-                    max_file_size=50_000_000,
-                ).props('accept=".pdf"').classes("hidden")
+                upload = (
+                    ui.upload(
+                        on_upload=handle_upload,
+                        auto_upload=True,
+                        max_file_size=50_000_000,
+                    )
+                    .props('accept=".pdf"')
+                    .classes("hidden")
+                )
 
                 ui.button(
                     icon="description",
-                ).props('outline round size=md color="black"').tooltip(
-                    "Ladda upp PDF"
-                ).on(
+                ).props(
+                    'outline round size=md color="black"'
+                ).tooltip("Ladda upp PDF").on(
                     "click",
                     js_handler="() => { document.querySelector('.hidden input[type=file]').click(); }",
                 )
 
                 ui.space()
+
+                options = model_options()
+                saved_model = app.storage.user.get("selected_model", DEFAULT_MODEL)
+                if saved_model not in options:
+                    worker_model = (worker_status_info or {}).get("model")
+                    saved_model = worker_model if worker_model in options else next(iter(options))
+                model_select = (
+                    ui.select(
+                        options=options,
+                        value=saved_model,
+                        on_change=lambda e: app.storage.user.update(
+                            selected_model=e.value
+                        ),
+                    )
+                    .classes("w-80 vr-model-select")
+                    .props('dense outlined"')
+                    .tooltip("Välj LLM-modell")
+                    .style("height: 36px;")
+                )
 
                 async def handle_question():
                     question = question_input.value.strip()
@@ -684,6 +835,7 @@ def main_page():
                             "type": "ask",
                             "id": str(uuid.uuid4()),
                             "question": question,
+                            "model": model_select.value,
                         }
 
                         app.storage.user["active_job_id"] = job["id"]
@@ -695,12 +847,15 @@ def main_page():
                         progress_row.set_visibility(False)
                         analyse_btn.enable()
 
-                analyse_btn = ui.button(
-                    "Analysera", on_click=handle_question, icon="search"
-                ).props('outline no-caps color="black"').classes("vr-btn")
+                analyse_btn = (
+                    ui.button("Analysera", on_click=handle_question, icon="search")
+                    .props('outline no-caps color="black"')
+                    .classes("vr-btn")
+                )
 
             # Cmd+Enter (Mac) / Ctrl+Enter (Win/Linux) to submit
-            ui.add_body_html(f"""<script>
+            ui.add_body_html(
+                f"""<script>
             document.addEventListener('keydown', function(e) {{
                 if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {{
                     e.preventDefault();
@@ -708,15 +863,20 @@ def main_page():
                     if (btn) btn.click();
                 }}
             }});
-            </script>""")
-            analyse_btn._props['id'] = 'analyse-btn'
+            </script>"""
+            )
+            analyse_btn._props["id"] = "analyse-btn"
             analyse_btn.update()
 
         # --- Progress indicator ---
-        with ui.row().classes("w-full items-center q-mt-md vr-progress") as progress_row:
+        with ui.row().classes(
+            "w-full items-center q-mt-md vr-progress"
+        ) as progress_row:
             ui.spinner("dots", size="lg", color="black")
             with ui.column().classes("gap-0"):
-                result_step = ui.label("").classes("vr-progress-text").style("font-weight: 600;")
+                result_step = (
+                    ui.label("").classes("vr-progress-text").style("font-weight: 600;")
+                )
                 result_detail = ui.label("").classes("vr-progress-text")
         progress_row.set_visibility(False)
 
@@ -738,8 +898,7 @@ def main_page():
 
         def _is_dark() -> bool:
             return dark.value is True or (
-                dark.value is None
-                and app.storage.browser.get("dark_mode")
+                dark.value is None and app.storage.browser.get("dark_mode")
             )
 
         def _render_final(text: str):
@@ -768,9 +927,7 @@ def main_page():
                             fig = build_plotly_figure(spec, dark=is_dark)
                             ui.plotly(fig).classes("w-full")
                         except (json.JSONDecodeError, KeyError):
-                            ui.markdown(f"```\n{content}\n```").classes(
-                                "w-full"
-                            )
+                            ui.markdown(f"```\n{content}\n```").classes("w-full")
             result_container.set_visibility(True)
             result_card.set_visibility(True)
             # Re-theme charts after render based on actual browser state
@@ -837,11 +994,16 @@ def main_page():
             _render_final(saved_result)
 
 
-VR_FAVICON = "https://www.vr.se/images/18.781fb755163605b8cd26282f/1526903371336/VR_symbol.svg"
+VR_FAVICON = (
+    "https://www.vr.se/images/18.781fb755163605b8cd26282f/1526903371336/VR_symbol.svg"
+)
 
 ui.run(
     title="Beslutstödssystem",
     port=7777,
-    storage_secret="beslut-rag-secret",
+    storage_secret=STORAGE_SECRET,
     favicon=VR_FAVICON,
+    # Autoreload watches every .py file here, including worker.py and
+    # ingest.py, and restarts the server mid-job. Opt in for development only.
+    reload=os.getenv("APP_RELOAD", "0") == "1",
 )

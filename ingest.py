@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 from rich.console import Console
 from rich.progress import (
+    track,
     BarColumn,
     MofNCompleteColumn,
     Progress,
@@ -300,15 +301,19 @@ def extract_metadata(text: str, filename: str, pages: int = 0) -> dict:
             if m:
                 metadata["diarienummer"] = m.group(1)
 
-    # Year: filename first (e.g. "_VR_2014", "2019 Forskningsbarometer"),
-    # then date, then the first plausible year in the document head.
-    years = [int(y) for y in YEAR_PATTERN.findall(filename)]
-    year = years[-1] if years else None
-    if not year and "date" in metadata:
+    # Year: the document date if found, else the last plausible year in the
+    # filename (e.g. "_VR_2014", "2019 Forskningsbarometer"; plan periods like
+    # "2026-2037" must not win), else the most common plausible year in the head.
+    max_year = time.localtime().tm_year + 1
+    plausible = lambda ys: [y for y in ys if 1980 <= y <= max_year]
+    year = None
+    if "date" in metadata:
         year = int(metadata["date"][:4])
     if not year:
-        years = [int(y) for y in YEAR_PATTERN.findall(head)]
-        years = [y for y in years if 1980 <= y <= 2035]
+        years = plausible(int(y) for y in YEAR_PATTERN.findall(filename))
+        year = years[-1] if years else None
+    if not year:
+        years = plausible(int(y) for y in YEAR_PATTERN.findall(head))
         if years:
             year = Counter(years).most_common(1)[0][0]
     if year:
@@ -501,7 +506,7 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _chunk_id(source: str, index: int) -> str:
+def chunk_id(source: str, index: int) -> str:
     return f"{hashlib.sha1(source.encode()).hexdigest()[:16]}_{index}"
 
 
@@ -520,7 +525,13 @@ def _iter_collection(collection, batch: int = 5000):
 def build_bm25(collection) -> int:
     """Rebuild the BM25 index from everything in ChromaDB. Returns corpus size."""
     corpus = [
-        {"doc_id": meta["filename"], "text": doc, "section": meta.get("section", "")}
+        {
+            "doc_id": meta["filename"],
+            "text": doc,
+            "section": meta.get("section", ""),
+            "source": meta.get("source", ""),
+            "chunk_index": meta.get("chunk_index", 0),
+        }
         for doc, meta in _iter_collection(collection)
     ]
     if not corpus:
@@ -664,7 +675,7 @@ def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | No
             chunk_texts = [c["text"] for c in chunks]
             embeddings = embed_passages(model, chunk_texts)
 
-            ids = [_chunk_id(source, i) for i in range(len(chunks))]
+            ids = [chunk_id(source, i) for i in range(len(chunks))]
             metadatas = []
             for c in chunks:
                 meta = {
@@ -723,13 +734,62 @@ def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | No
     console.print(f"Fulltexter: {FULL_TEXTS_PATH} ({len(full_texts)} dokument)")
 
 
+def refresh_metadata() -> int:
+    """Recompute document metadata from stored full texts and update ChromaDB.
+
+    Lets metadata heuristics improve without re-extracting or re-embedding.
+    Returns the number of documents updated.
+    """
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    collection = client.get_collection(COLLECTION_NAME)
+    full_texts = _load_full_texts()
+    docs = {}
+    for _, meta in _iter_collection(collection):
+        docs.setdefault(meta["source"], meta)
+    updated = 0
+    for source, meta in track(list(docs.items()), description="Uppdaterar metadata"):
+        text = full_texts.get(meta["filename"])
+        if text is None:
+            continue
+        new = extract_metadata(text, meta["filename"], pages=meta.get("pages", 0))
+        keys = ("date", "diarienummer", "year", "language", "doc_type", "decision_type", "title", "pages")
+        if all(meta.get(k) == new.get(k) for k in keys):
+            continue
+        total = int(meta["total_chunks"])
+        ids = [chunk_id(source, i) for i in range(total)]
+        res = collection.get(ids=ids, include=["metadatas"])
+        metadatas = []
+        for m in res["metadatas"]:
+            m = {k: v for k, v in m.items() if k not in keys}
+            m.update(new)
+            metadatas.append(m)
+        collection.update(ids=res["ids"], metadatas=metadatas)
+        updated += 1
+    return updated
+
+
 def main():
     parser = argparse.ArgumentParser(description="Mata in PDF:er i sökindexet.")
-    parser.add_argument("pdf_dir", help="Mapp med PDF-filer (söks rekursivt)")
+    parser.add_argument("pdf_dir", nargs="?", help="Mapp med PDF-filer (söks rekursivt)")
     parser.add_argument("--reset", action="store_true", help="Ta bort befintligt index först")
     parser.add_argument("--ocr", action="store_true", help="OCR:a sidor som saknar textlager (kräver tesseract)")
     parser.add_argument("--limit", type=int, default=None, help="Bearbeta bara de N första filerna (test)")
+    parser.add_argument("--rebuild-bm25", action="store_true", help="Bygg bara om BM25-indexet från databasen")
+    parser.add_argument("--refresh-metadata", action="store_true", help="Räkna om metadata från lagrade fulltexter utan ny inbäddning")
     args = parser.parse_args()
+    if not args.pdf_dir and not (args.rebuild_bm25 or args.refresh_metadata):
+        parser.error("ange en PDF-mapp, --rebuild-bm25 eller --refresh-metadata")
+    if args.refresh_metadata:
+        n = refresh_metadata()
+        console.print(f"[green]Klart.[/green] Metadata uppdaterad för {n} dokument")
+        return
+    if args.rebuild_bm25:
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        collection = client.get_collection(COLLECTION_NAME)
+        console.print("Bygger BM25-index från databasen...")
+        n = build_bm25(collection)
+        console.print(f"[green]Klart.[/green] BM25-index: {BM25_PATH} ({n} stycken)")
+        return
     ingest(args.pdf_dir, reset=args.reset, ocr=args.ocr, limit=args.limit)
 
 
