@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import uuid
+from functools import partial
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
@@ -493,7 +494,8 @@ VR_STYLE = """
     --vr-bg-subtle: #f5f5f5;
     --vr-border: #e0e0e0;
     --vr-text: #333333;
-    --vr-text-muted: rgba(0,0,0,0.5);
+    --vr-text-muted: rgba(0,0,0,0.65);
+    --vr-border-strong: #9e9e9e;
     --vr-quote: #555555;
 }
 
@@ -504,7 +506,8 @@ VR_STYLE = """
         --vr-bg-subtle: #2a2a2a;
         --vr-border: #444444;
         --vr-text: #e0e0e0;
-        --vr-text-muted: rgba(255,255,255,0.5);
+        --vr-text-muted: rgba(255,255,255,0.7);
+        --vr-border-strong: #8a8a8a;
         --vr-quote: #aaaaaa;
     }
 }
@@ -515,7 +518,8 @@ body.body--dark {
     --vr-bg-subtle: #2a2a2a;
     --vr-border: #444444;
     --vr-text: #e0e0e0;
-    --vr-text-muted: rgba(255,255,255,0.5);
+    --vr-text-muted: rgba(255,255,255,0.7);
+    --vr-border-strong: #8a8a8a;
     --vr-quote: #aaaaaa;
 }
 
@@ -531,7 +535,8 @@ body.body--dark .q-btn--outline.q-btn--outline {
     border: 1px solid #ffffff !important;
 }
 
-body.body--dark .q-spinner {
+body.body--dark .q-spinner,
+body.body--dark .q-btn--flat .q-icon {
     color: #ffffff !important;
 }
 
@@ -642,13 +647,99 @@ body.body--dark .vr-model-select .q-field__append {
 }
 
 .vr-result {
-    background-color: var(--vr-bg-subtle);
-    border-left: 4px solid var(--vr-fg);
-    border-radius: 0 4px 4px 0;
-    padding: 1.5rem 2rem;
     font-family: 'Open Sans', Arial, sans-serif;
     line-height: 1.7;
     color: var(--vr-text);
+    max-width: 72ch;
+}
+.vr-result a { color: var(--vr-fg); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.vr-link { color: var(--vr-fg) !important; }
+
+/* Conversation */
+.vr-conversation {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+}
+.vr-empty {
+    padding-top: 18vh;
+    text-align: center;
+}
+.vr-greeting {
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: var(--vr-fg);
+    line-height: 1.3;
+}
+.vr-greeting-sub {
+    color: var(--vr-text-muted);
+    max-width: 48ch;
+    line-height: 1.5;
+}
+.vr-example {
+    border-radius: 999px !important;
+    font-size: 0.95rem !important;
+    font-weight: 400 !important;
+    padding: 0.35rem 1.1rem !important;
+}
+.vr-user-msg {
+    background-color: var(--vr-bg-subtle);
+    border-radius: 14px 14px 2px 14px;
+    padding: 0.7rem 1rem;
+    max-width: 85%;
+    white-space: pre-wrap;
+    line-height: 1.5;
+    color: var(--vr-fg);
+}
+
+/* Composer */
+.q-footer {
+    background-color: var(--vr-bg) !important;
+    padding: 0.5rem 0 0.75rem;
+}
+.vr-composer {
+    border: 1px solid var(--vr-border-strong);
+    border-radius: 14px;
+    padding: 0.5rem 0.75rem 0.4rem;
+    background-color: var(--vr-bg);
+}
+.vr-composer:focus-within {
+    border-color: var(--vr-fg);
+}
+.vr-composer-input textarea::placeholder {
+    color: var(--vr-text-muted);
+    opacity: 1;
+}
+.vr-composer-input textarea {
+    max-height: 40vh;
+    font-size: 1rem;
+    line-height: 1.5;
+}
+.vr-composer .q-field--dense .q-field__control { min-height: 32px; }
+/* Send button colours are set inline; Quasar's bg-primary wins over class rules */
+/* The global focus rule fills :after with the foreground colour, which covers
+   a whole borderless control (textarea, model select) in black */
+.vr-composer .q-field__control:before,
+.vr-composer .q-field__control:after {
+    display: none !important;
+}
+.vr-send.disabled, .vr-send[disabled] {
+    opacity: 0.3 !important;
+}
+/* Selected model in the dropdown: brand colour instead of Quasar blue */
+.q-menu .q-item.q-item--active {
+    color: var(--vr-fg) !important;
+    font-weight: 600;
+}
+body.body--dark .q-menu .q-item.q-item--active {
+    color: #ffffff !important;
+}
+
+.vr-disclaimer {
+    font-size: 0.78rem;
+    color: var(--vr-text-muted);
+    text-align: center;
+    width: 100%;
+    margin-top: 0.4rem;
 }
 
 .vr-result h1, .vr-result h2, .vr-result h3 {
@@ -681,12 +772,10 @@ body.body--dark .vr-model-select .q-field__append {
 }
 
 .vr-progress {
-    background-color: var(--vr-bg-subtle);
-    border-radius: 4px;
-    padding: 1rem 1.5rem;
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: 0.75rem;
+    padding: 0.25rem 0;
 }
 
 .vr-progress-text {
@@ -797,230 +886,112 @@ def main_page():
     saved_sources = app.storage.user.get("last_sources", [])
     active_job_id = app.storage.user.get("active_job_id")
 
-    # --- Main content ---
-    with ui.column().classes("w-full max-w-4xl mx-auto q-mt-lg q-px-md"):
-        with ui.card().classes("w-full vr-card q-pa-lg"):
-            ui.label(
-                "Ställ en fråga om Vetenskapsrådets dokument: rapporter, utvärderingar, "
-                "utlysningar, forskningsöversikter, yttranden och beslut."
-            ).classes("text-subtitle1 q-mb-md").style("font-weight: 600;")
-
-            question_input = ui.textarea(
-                label="Din fråga:",
-                placeholder="Beskriv den nya situationen eller ställ en fråga...",
-                value=saved_question,
-            ).classes("w-full")
-
-            # --- Action row: file icon (left) + Analyse button (right) ---
-            with ui.row().classes("w-full items-center q-mt-sm"):
-                pdf_file_label = ui.label("").classes("text-caption opacity-70")
-
-                async def handle_upload(e):
-                    pdf_file_label.set_text(f"PDF: {e.file.name}")
-                    _clear_result()
-                    progress_row.set_visibility(True)
-                    result_step.set_text("Steg 1/3 — Läser PDF")
-                    result_detail.set_text(f"Laddar upp {e.file.name}...")
-                    analyse_btn.disable()
-
-                    try:
-                        pdf_bytes = await e.file.read()
-                        encoded = base64.b64encode(pdf_bytes).decode()
-
-                        result_step.set_text("Steg 2/3 — Söker i databasen")
-                        result_detail.set_text("Skickar PDF till worker för analys...")
-
-                        job = {
-                            "type": "ask-pdf",
-                            "id": str(uuid.uuid4()),
-                            "pdf_base64": encoded,
-                            "model": model_select.value,
-                        }
-
-                        app.storage.user["active_job_id"] = job["id"]
-                        app.storage.user["last_question"] = f"[PDF: {e.file.name}]"
-                        _ensure_job_buffer(job["id"])
-                        asyncio.create_task(start_buffered_job(job))
-                        await _follow_and_display(job["id"], f"[PDF: {e.file.name}]")
-                    finally:
-                        progress_row.set_visibility(False)
-                        analyse_btn.enable()
-
-                upload = (
-                    ui.upload(
-                        on_upload=handle_upload,
-                        auto_upload=True,
-                        max_file_size=50_000_000,
-                    )
-                    .props('accept=".pdf"')
-                    .classes("hidden")
-                )
-
-                ui.button(
-                    icon="description",
-                ).props(
-                    'outline round size=md color="black"'
-                ).tooltip("Ladda upp PDF").on(
-                    "click",
-                    js_handler="() => { document.querySelector('.hidden input[type=file]').click(); }",
-                )
-
-                ui.space()
-
-                options = model_options()
-                saved_model = app.storage.user.get("selected_model", DEFAULT_MODEL)
-                if saved_model not in options:
-                    worker_model = (worker_status_info or {}).get("model")
-                    saved_model = worker_model if worker_model in options else next(iter(options))
-                model_select = (
-                    ui.select(
-                        options=options,
-                        value=saved_model,
-                        on_change=lambda e: app.storage.user.update(
-                            selected_model=e.value
-                        ),
-                    )
-                    .classes("w-80 vr-model-select")
-                    .props('dense outlined"')
-                    .tooltip("Välj LLM-modell")
-                    .style("height: 36px;")
-                )
-
-                async def handle_question():
-                    question = question_input.value.strip()
-                    if not question:
-                        ui.notify("Skriv en fråga först.", type="warning")
-                        return
-
-                    _clear_result()
-                    progress_row.set_visibility(True)
-                    result_step.set_text("Steg 1/3 — Skickar fråga")
-                    result_detail.set_text("Väntar på analys...")
-                    analyse_btn.disable()
-
-                    try:
-                        job = {
-                            "type": "ask",
-                            "id": str(uuid.uuid4()),
-                            "question": question,
-                            "model": model_select.value,
-                        }
-
-                        app.storage.user["active_job_id"] = job["id"]
-                        app.storage.user["last_question"] = question
-                        _ensure_job_buffer(job["id"])
-                        asyncio.create_task(start_buffered_job(job))
-                        await _follow_and_display(job["id"], question)
-                    finally:
-                        progress_row.set_visibility(False)
-                        analyse_btn.enable()
-
-                analyse_btn = (
-                    ui.button("Analysera", on_click=handle_question, icon="search")
-                    .props('outline no-caps color="black"')
-                    .classes("vr-btn")
-                )
-
-            # Cmd+Enter (Mac) / Ctrl+Enter (Win/Linux) to submit
-            ui.add_body_html(
-                f"""<script>
-            document.addEventListener('keydown', function(e) {{
-                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {{
-                    e.preventDefault();
-                    var btn = document.getElementById('analyse-btn');
-                    if (btn) btn.click();
-                }}
-            }});
-            </script>"""
-            )
-            analyse_btn._props["id"] = "analyse-btn"
-            analyse_btn.update()
-
-        # --- Progress indicator ---
-        with ui.row().classes(
-            "w-full items-center q-mt-md vr-progress"
-        ) as progress_row:
-            ui.spinner("dots", size="lg", color="black")
-            with ui.column().classes("gap-0"):
-                result_step = (
-                    ui.label("").classes("vr-progress-text").style("font-weight: 600;")
-                )
-                result_detail = ui.label("").classes("vr-progress-text")
-        progress_row.set_visibility(False)
-
-        # --- Result area: single card holding streaming markdown OR final mixed content ---
-        with ui.card().classes("w-full q-mt-md vr-card vr-result") as result_card:
-            result_stream = ui.markdown("").classes("w-full")
-            result_stream.set_visibility(False)
-            result_container = ui.column().classes("w-full gap-4")
-            result_container.set_visibility(False)
-            sources_box = ui.column().classes("w-full gap-1 q-mt-md vr-sources")
-            sources_box.set_visibility(False)
-        result_card.set_visibility(False)
-
-        # Links in answers lead to vr.se; open them in a new tab.
-        ui.add_body_html(
-            """<script>
-            document.addEventListener('click', function(e) {
-                var a = e.target.closest && e.target.closest('.vr-result a[href^="http"]');
-                if (a) { a.target = '_blank'; a.rel = 'noopener'; }
-            });
-            </script>"""
+    def _is_dark() -> bool:
+        return dark.value is True or (
+            dark.value is None and app.storage.browser.get("dark_mode")
         )
 
-        def _clear_result():
-            """Hide both result views and clear content."""
-            result_stream.set_content("")
-            result_stream.set_visibility(False)
-            result_container.clear()
-            result_container.set_visibility(False)
-            sources_box.clear()
-            sources_box.set_visibility(False)
-            result_card.set_visibility(False)
+    async def ask_example(question: str):
+        question_input.set_value(question)
+        await handle_question()
 
-        def _render_sources(sources: list[dict]):
-            """List the cited documents with links to the search on vr.se."""
-            sources_box.clear()
+    # --- Conversation ---
+    with ui.column().classes("w-full max-w-3xl mx-auto q-px-md vr-conversation"):
+        with ui.column().classes("w-full items-center vr-empty") as empty_state:
+            ui.label("Vad vill du veta om Vetenskapsrådets dokument?").classes("vr-greeting")
+            ui.label(
+                "Rapporter, utvärderingar, utlysningar och forskningsöversikter. "
+                "Ladda upp en PDF för att få den bedömd mot dem."
+            ).classes("vr-greeting-sub")
+            with ui.row().classes("justify-center gap-2 q-mt-md"):
+                for example in (
+                    "Hur många rapporter finns per år?",
+                    "Vad säger dokumenten om öppen vetenskap?",
+                    "Vilka utlysningar riktar sig till unga forskare?",
+                ):
+                    ui.button(example, on_click=partial(ask_example, example)).props(
+                        'outline no-caps color="black"'
+                    ).classes("vr-btn vr-example")
+        conversation = ui.column().classes("w-full gap-8")
+
+    class Turn:
+        """One question with its streamed answer, progress and sources."""
+
+        def __init__(self, question_label: str):
+            empty_state.set_visibility(False)
+            with conversation:
+                with ui.column().classes("w-full gap-3 vr-turn"):
+                    with ui.row().classes("w-full justify-end"):
+                        ui.label(question_label).classes("vr-user-msg")
+                    with ui.row().classes("items-center vr-progress") as self.progress:
+                        ui.spinner("dots", size="md", color="black")
+                        with ui.column().classes("gap-0"):
+                            self.step = ui.label("").classes("vr-progress-text").style("font-weight: 600;")
+                            self.detail = ui.label("").classes("vr-progress-text")
+                    with ui.column().classes("w-full gap-4 vr-result") as self.answer:
+                        self.stream = ui.markdown("").classes("w-full")
+                        self.container = ui.column().classes("w-full gap-4")
+                        self.container.set_visibility(False)
+                        self.sources_box = ui.column().classes("w-full gap-1 q-mt-sm vr-sources")
+                        self.sources_box.set_visibility(False)
+                    self.answer.set_visibility(False)
+
+        def set_progress(self, step: str, detail: str = ""):
+            self.step.set_text(step)
+            self.detail.set_text(detail)
+            self.progress.set_visibility(True)
+
+        def render_sources(self, sources: list[dict]):
+            """List the cited documents with links to vr.se."""
+            self.sources_box.clear()
             if not sources:
-                sources_box.set_visibility(False)
+                self.sources_box.set_visibility(False)
                 return
-            with sources_box:
+            with self.sources_box:
                 ui.label("Källor").classes("text-subtitle2").style("font-weight: 600;")
                 for src in sources:
-                    bits = [b for b in (src.get("doc_type") if src.get("doc_type") not in ("", "okänd") else "", src.get("year"), f"dnr {src['diarienummer']}" if src.get("diarienummer") else "") if b]
+                    bits = [
+                        b
+                        for b in (
+                            src.get("doc_type") if src.get("doc_type") not in ("", "okänd") else "",
+                            src.get("year"),
+                            f"dnr {src['diarienummer']}" if src.get("diarienummer") else "",
+                        )
+                        if b
+                    ]
                     with ui.row().classes("items-baseline gap-2 no-wrap"):
                         ui.link(_doc_stem(src["filename"]), source_url(src), new_tab=True).classes("vr-link")
                         if bits:
-                            ui.label("(" + ", ".join(str(b) for b in bits) + ")").classes("text-caption opacity-70")
-            sources_box.set_visibility(True)
+                            ui.label("(" + ", ".join(str(b) for b in bits) + ")").classes("text-caption opacity-70").style("white-space: nowrap;")
+            self.sources_box.set_visibility(True)
 
-        def _is_dark() -> bool:
-            return dark.value is True or (
-                dark.value is None and app.storage.browser.get("dark_mode")
-            )
+        def render_stream(self, text: str):
+            self.stream.set_content(normalize_bullets(text))
+            self.stream.set_visibility(True)
+            self.answer.set_visibility(True)
 
-        def _render_final(text: str, sources: list[dict] | None = None):
+        def render_final(self, text: str, sources: list[dict] | None = None):
             """Parse text for chart blocks and render mixed markdown + Plotly."""
             sources = sources or []
-            result_stream.set_visibility(False)
-            result_container.clear()
+            self.progress.set_visibility(False)
+            self.container.clear()
             segments = [
                 ("md", linkify_sources(normalize_bullets(content), sources)) if kind == "md" else (kind, content)
                 for kind, content in parse_chart_segments(text)
             ]
             has_charts = any(s[0] == "chart" for s in segments)
-            _render_sources(sources)
+            self.render_sources(sources)
+            self.answer.set_visibility(True)
 
             if not has_charts:
-                # No charts — just show as markdown in the card
-                result_stream.set_content(segments[0][1] if segments else "")
-                result_stream.set_visibility(True)
-                result_container.set_visibility(False)
-                result_card.set_visibility(True)
+                self.stream.set_content(segments[0][1] if segments else "")
+                self.stream.set_visibility(True)
+                self.container.set_visibility(False)
                 return
 
+            self.stream.set_visibility(False)
             is_dark = _is_dark()
-            with result_container:
+            with self.container:
                 for seg_type, content in segments:
                     if seg_type == "md" and content.strip():
                         ui.markdown(content).classes("w-full")
@@ -1031,8 +1002,7 @@ def main_page():
                             ui.plotly(fig).classes("w-full")
                         except (json.JSONDecodeError, KeyError):
                             ui.markdown(f"```\n{content}\n```").classes("w-full")
-            result_container.set_visibility(True)
-            result_card.set_visibility(True)
+            self.container.set_visibility(True)
             # Re-theme charts after render based on actual browser state
             ui.run_javascript(
                 "setTimeout(function(){"
@@ -1055,50 +1025,164 @@ def main_page():
                 "});},200);"
             )
 
-        async def _follow_and_display(job_id: str, question_label: str):
-            """Stream results from a buffered job into the UI."""
-            full_text = ""
-            sources: list[dict] = []
-            async for msg in follow_job(job_id):
-                if msg["type"] == "sources":
-                    sources = msg["sources"]
-                elif msg["type"] == "chunk":
-                    num_sources = msg.get("num_sources", 0)
-                    result_step.set_text("Steg 3/3 — Genererar svar")
-                    result_detail.set_text(
-                        f"Hittade {num_sources} relevanta dokument. Skriver svar..."
+    def _scroll_to_bottom():
+        ui.run_javascript("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
+
+    async def _follow_and_display(job_id: str, turn: Turn):
+        """Stream results from a buffered job into the turn."""
+        full_text = ""
+        sources: list[dict] = []
+        async for msg in follow_job(job_id):
+            if msg["type"] == "sources":
+                sources = msg["sources"]
+            elif msg["type"] == "chunk":
+                num_sources = msg.get("num_sources", 0)
+                turn.set_progress("Skriver svar", f"{num_sources} relevanta dokument hittade")
+                full_text = msg["text"]
+                turn.render_stream(full_text)
+            elif msg["type"] == "error":
+                turn.progress.set_visibility(False)
+                turn.render_stream(f"**Fel:** {msg['message']}")
+            elif msg["type"] == "done":
+                turn.render_final(full_text, sources)
+                app.storage.user["last_result"] = full_text
+                app.storage.user["last_sources"] = sources
+                app.storage.user.pop("active_job_id", None)
+                _scroll_to_bottom()
+
+    async def _run_job(job: dict, question_label: str):
+        turn = Turn(question_label)
+        turn.set_progress("Söker i databasen", "Väntar på analys...")
+        _scroll_to_bottom()
+        analyse_btn.disable()
+        try:
+            app.storage.user["active_job_id"] = job["id"]
+            app.storage.user["last_question"] = question_label
+            _ensure_job_buffer(job["id"])
+            asyncio.create_task(start_buffered_job(job))
+            await _follow_and_display(job["id"], turn)
+        finally:
+            turn.progress.set_visibility(False)
+            analyse_btn.enable()
+
+    # --- Composer, pinned to the bottom ---
+    with ui.footer().classes("vr-footer"):
+        with ui.column().classes("w-full max-w-3xl mx-auto q-px-md"):
+            with ui.column().classes("w-full gap-0 vr-composer"):
+                question_input = (
+                    ui.textarea(placeholder="Ställ en fråga om Vetenskapsrådets dokument...")
+                    .classes("w-full vr-composer-input")
+                    .props("borderless autogrow dense")
+                    .on(
+                        "keydown",
+                        js_handler="""(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                var btn = document.getElementById('analyse-btn');
+                                if (btn && !btn.disabled) btn.click();
+                            }
+                        }""",
                     )
-                    full_text = msg["text"]
-                    result_stream.set_content(normalize_bullets(full_text))
-                    result_stream.set_visibility(True)
-                    result_card.set_visibility(True)
-                elif msg["type"] == "error":
-                    result_stream.set_content(f"**Fel:** {msg['message']}")
-                    result_stream.set_visibility(True)
-                    result_card.set_visibility(True)
-                elif msg["type"] == "done":
-                    _render_final(full_text, sources)
-                    app.storage.user["last_result"] = full_text
-                    app.storage.user["last_sources"] = sources
-                    app.storage.user.pop("active_job_id", None)
-                    progress_row.set_visibility(False)
+                )
 
-        async def _resume_job():
-            try:
-                await _follow_and_display(active_job_id, saved_question)
-            finally:
-                progress_row.set_visibility(False)
-                analyse_btn.enable()
+                with ui.row().classes("w-full items-center no-wrap gap-2"):
 
-        # --- Resume in-progress job or restore last result ---
-        if active_job_id and active_job_id in active_jobs:
-            progress_row.set_visibility(True)
-            result_step.set_text("Återansluter...")
-            result_detail.set_text("Hämtar pågående analys...")
-            analyse_btn.disable()
-            asyncio.create_task(_resume_job())
-        elif saved_result:
-            _render_final(saved_result, saved_sources)
+                    async def handle_upload(e):
+                        pdf_file_label.set_text(e.file.name)
+                        pdf_bytes = await e.file.read()
+                        pdf_file_label.set_text("")
+                        job = {
+                            "type": "ask-pdf",
+                            "id": str(uuid.uuid4()),
+                            "pdf_base64": base64.b64encode(pdf_bytes).decode(),
+                            "model": model_select.value,
+                        }
+                        await _run_job(job, f"PDF: {e.file.name}")
+
+                    ui.upload(
+                        on_upload=handle_upload,
+                        auto_upload=True,
+                        max_file_size=50_000_000,
+                    ).props('accept=".pdf"').classes("hidden")
+
+                    ui.button(icon="attach_file").props('flat round size=sm color="black"').tooltip(
+                        "Ladda upp PDF för bedömning"
+                    ).on(
+                        "click",
+                        js_handler="() => { document.querySelector('.hidden input[type=file]').click(); }",
+                    )
+                    pdf_file_label = ui.label("").classes("text-caption opacity-70")
+
+                    ui.space()
+
+                    options = model_options()
+                    saved_model = app.storage.user.get("selected_model", DEFAULT_MODEL)
+                    if saved_model not in options:
+                        worker_model = (worker_status_info or {}).get("model")
+                        saved_model = worker_model if worker_model in options else next(iter(options))
+                    model_select = (
+                        ui.select(
+                            options=options,
+                            value=saved_model,
+                            on_change=lambda e: app.storage.user.update(selected_model=e.value),
+                        )
+                        .classes("vr-model-select")
+                        .props("dense borderless options-dense")
+                        .tooltip("Välj LLM-modell")
+                    )
+
+                    async def handle_question():
+                        question = question_input.value.strip()
+                        if not question:
+                            return
+                        question_input.set_value("")
+                        job = {
+                            "type": "ask",
+                            "id": str(uuid.uuid4()),
+                            "question": question,
+                            "model": model_select.value,
+                        }
+                        await _run_job(job, question)
+
+                    analyse_btn = (
+                        ui.button(icon="arrow_upward", on_click=handle_question)
+                        .props("round unelevated size=sm")
+                        .classes("vr-send")
+                        .style("background-color: var(--vr-fg) !important; color: var(--vr-bg) !important;")
+                        .tooltip("Skicka (Enter)")
+                    )
+                    analyse_btn._props["id"] = "analyse-btn"
+                    analyse_btn.update()
+
+            ui.label("Svaren bygger på Vetenskapsrådets publicerade dokument och kan innehålla fel.").classes(
+                "vr-disclaimer"
+            )
+
+    # Links in answers lead to vr.se; open them in a new tab.
+    ui.add_body_html(
+        """<script>
+        document.addEventListener('click', function(e) {
+            var a = e.target.closest && e.target.closest('.vr-result a[href^="http"]');
+            if (a) { a.target = '_blank'; a.rel = 'noopener'; }
+        });
+        </script>"""
+    )
+
+    async def _resume_job():
+        turn = Turn(saved_question)
+        turn.set_progress("Återansluter", "Hämtar pågående analys...")
+        analyse_btn.disable()
+        try:
+            await _follow_and_display(active_job_id, turn)
+        finally:
+            turn.progress.set_visibility(False)
+            analyse_btn.enable()
+
+    # --- Resume in-progress job or restore last result ---
+    if active_job_id and active_job_id in active_jobs:
+        asyncio.create_task(_resume_job())
+    elif saved_result:
+        Turn(saved_question).render_final(saved_result, saved_sources)
 
 
 VR_FAVICON = (
@@ -1106,8 +1190,8 @@ VR_FAVICON = (
 )
 
 ui.run(
-    title="Beslutstödssystem",
-    port=7777,
+    title="Analys",
+    port=int(os.getenv("APP_PORT", "7777")),
     storage_secret=STORAGE_SECRET,
     favicon=VR_FAVICON,
     # Autoreload watches every .py file here, including worker.py and
