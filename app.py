@@ -82,25 +82,55 @@ def _md_escape(text: str) -> str:
     return re.sub(r"([\\`*_\[\]<>])", r"\\\1", text)
 
 
-def linkify_sources(text: str, sources: list[dict]) -> str:
-    """Turn mentions of known document names in the answer into vr.se search links.
+# Code blocks, inline code and existing Markdown links: text inside them is
+# never linkified in place.
+_PROTECTED_MD = re.compile(r"(```.*?```|`[^`\n]+`|\[[^\]\n]*\]\([^)\n]*\))", re.DOTALL)
 
-    One regex pass over all names (longest first) so inserted link text and
-    URLs are never re-matched. Mentions already inside a link are skipped.
+
+def linkify_sources(text: str, sources: list[dict]) -> str:
+    """Turn mentions of known document names in the answer into links.
+
+    Plain-text mentions are matched in one regex pass (longest name first), so
+    inserted link text and URLs are never re-matched. Models often wrap file
+    names in backticks; such a code span is replaced by a link when its whole
+    content is a known name, also if the model shortened it with "...".
+    Fenced code and existing links are left untouched.
     """
     urls = {_doc_stem(s["filename"]).lower(): source_url(s) for s in sources if s.get("filename")}
-    stems = sorted(urls, key=len, reverse=True)
-    if not stems:
+    if not urls:
         return text
+    stems = sorted(urls, key=len, reverse=True)
     pattern = re.compile(
         r"(?<![\[\w=/])(" + "|".join(re.escape(st) for st in stems) + r")(\.pdf)?(?![\w\]])",
         re.IGNORECASE,
     )
 
-    def link(m: re.Match) -> str:
-        return f"[{_md_escape(m.group(0))}]({urls[m.group(1).lower()]})"
+    def link(label: str, url: str) -> str:
+        return f"[{_md_escape(label)}]({url})"
 
-    return pattern.sub(link, text)
+    def resolve(name: str) -> str | None:
+        """URL for a complete file name, or for one shortened as 'start...end'."""
+        key = _doc_stem(name.strip()).lower()
+        if key in urls:
+            return urls[key]
+        parts = re.split(r"\.\.\.|\u2026", key)
+        if len(parts) != 2 or len(parts[0]) < 8:
+            return None
+        head, tail = parts
+        hits = [u for st, u in urls.items() if st.startswith(head) and st.endswith(tail) and len(st) > len(head) + len(tail)]
+        return hits[0] if len(hits) == 1 else None
+
+    out = []
+    for i, piece in enumerate(_PROTECTED_MD.split(text)):
+        if i % 2 == 0:
+            out.append(pattern.sub(lambda m: link(m.group(0), urls[m.group(1).lower()]), piece))
+        elif piece.startswith("`") and not piece.startswith("```"):
+            inner = piece[1:-1]
+            url = resolve(inner)
+            out.append(link(inner.strip(), url) if url else piece)
+        else:
+            out.append(piece)
+    return "".join(out)
 
 
 def normalize_bullets(text: str) -> str:
@@ -1026,7 +1056,8 @@ def main_page():
             )
 
     def _scroll_to_bottom():
-        ui.run_javascript("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
+        """Jump to the newest turn and keep following it while the answer streams."""
+        ui.run_javascript("window.vrFollow = true; window.scrollTo(0, document.documentElement.scrollHeight);")
 
     async def _follow_and_display(job_id: str, turn: Turn):
         """Stream results from a buffered job into the turn."""
@@ -1048,7 +1079,6 @@ def main_page():
                 app.storage.user["last_result"] = full_text
                 app.storage.user["last_sources"] = sources
                 app.storage.user.pop("active_job_id", None)
-                _scroll_to_bottom()
 
     async def _run_job(job: dict, question_label: str):
         turn = Turn(question_label)
@@ -1165,6 +1195,29 @@ def main_page():
             var a = e.target.closest && e.target.closest('.vr-result a[href^="http"]');
             if (a) { a.target = '_blank'; a.rel = 'noopener'; }
         });
+        </script>"""
+    )
+
+    # Follow the answer as it is written. Scrolling up to read stops following;
+    # scrolling back to the bottom, or sending a new question, resumes it.
+    ui.add_body_html(
+        """<script>
+        (function() {
+            window.vrFollow = true;
+            var pending = false;
+            function atBottom() {
+                return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80;
+            }
+            window.addEventListener('scroll', function() { window.vrFollow = atBottom(); }, {passive: true});
+            new MutationObserver(function() {
+                if (!window.vrFollow || pending) return;
+                pending = true;
+                requestAnimationFrame(function() {
+                    pending = false;
+                    if (window.vrFollow) window.scrollTo(0, document.documentElement.scrollHeight);
+                });
+            }).observe(document.body, {childList: true, subtree: true, characterData: true});
+        })();
         </script>"""
     )
 

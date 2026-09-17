@@ -92,6 +92,12 @@ if LLM_API == "auto":
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_THINK = os.getenv("LLM_THINK", "0") == "1"  # reasoning models: keep thinking on?
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "1800"))  # seconds, long prompts on slow hardware
+# Sampling. Backends default to random sampling (Ollama: temperature 0.8, new
+# seed per request), so the same question gave different answers. Temperature 0
+# with a fixed seed makes answers repeatable; raise the temperature for more
+# varied wording.
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+LLM_SEED = int(os.getenv("LLM_SEED", "42"))
 
 # Multilingual cross-encoder for re-ranking. On a CUDA box with headroom,
 # RERANK_MODEL=BAAI/bge-reranker-v2-m3 scores better but is ~5x slower.
@@ -664,11 +670,17 @@ def llm_chat_stream(model: str, messages: list[dict]):
             "messages": messages,
             "stream": True,
             "think": LLM_THINK,
-            "options": {"num_ctx": NUM_CTX},
+            "options": {"num_ctx": NUM_CTX, "temperature": LLM_TEMPERATURE, "seed": LLM_SEED},
         }
     else:
         url = f"{LLM_URL}/chat/completions"
-        body = {"model": model, "messages": messages, "stream": True}
+        body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "temperature": LLM_TEMPERATURE,
+            "seed": LLM_SEED,  # vLLM and llama-server honour it; others ignore it
+        }
         if not LLM_THINK:
             # Honoured by vLLM/mlx-lm for models with a thinking switch; ignored elsewhere.
             body["chat_template_kwargs"] = {"enable_thinking": False}
