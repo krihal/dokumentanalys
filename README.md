@@ -32,6 +32,15 @@ uv run ingest.py --rebuild-bm25
 
 Indexet ligger i `chroma_db/`, `bm25_index.pkl` och `full_texts.json` (eller `RAG_DATA_DIR`).
 
+### Källänkar
+
+Svaren listar de dokument som använts, med länk till vr.se. Om PDF-mappen
+innehåller `manifest.json` (skrivs av nedladdaren i `~/vr`, filnamn → `url`
+och `page`) lagras länkarna i indexet och används direkt; annars länkas till
+en sökning på vr.se efter filnamnet. `RAG_MANIFEST=/sökväg/manifest.json`
+pekar ut en annan fil. Befintligt index får länkarna med
+`uv run ingest.py ~/vr/vr_pdfs --refresh-metadata`.
+
 ## LLM-backend
 
 Workern talar med valfri server via `LLM_URL`:

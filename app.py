@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import uuid
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 from nicegui import app, ui
@@ -55,6 +56,65 @@ def model_options() -> dict[str, str]:
     return dict(_MODEL_LABELS)
 
 _CHART_RE = re.compile(r"```chart\s*\n(.*?)```", re.DOTALL)
+
+
+VR_SEARCH_URL = "https://www.vr.se/sokresultat.html?query="
+
+
+def _doc_stem(filename: str) -> str:
+    return re.sub(r"\.pdf$", "", filename, flags=re.IGNORECASE)
+
+
+def vr_search_url(filename: str) -> str:
+    """Search on vr.se for a document by its file name (without extension)."""
+    return VR_SEARCH_URL + quote_plus(_doc_stem(filename))
+
+
+def source_url(src: dict) -> str:
+    """Link for a cited document: the page it was published on, else the file
+    itself, else a vr.se search for its name. url/page_url come from the
+    downloader's manifest.json via ingest."""
+    return src.get("page_url") or src.get("url") or vr_search_url(src["filename"])
+
+
+def _md_escape(text: str) -> str:
+    return re.sub(r"([\\`*_\[\]<>])", r"\\\1", text)
+
+
+def linkify_sources(text: str, sources: list[dict]) -> str:
+    """Turn mentions of known document names in the answer into vr.se search links.
+
+    One regex pass over all names (longest first) so inserted link text and
+    URLs are never re-matched. Mentions already inside a link are skipped.
+    """
+    urls = {_doc_stem(s["filename"]).lower(): source_url(s) for s in sources if s.get("filename")}
+    stems = sorted(urls, key=len, reverse=True)
+    if not stems:
+        return text
+    pattern = re.compile(
+        r"(?<![\[\w=/])(" + "|".join(re.escape(st) for st in stems) + r")(\.pdf)?(?![\w\]])",
+        re.IGNORECASE,
+    )
+
+    def link(m: re.Match) -> str:
+        return f"[{_md_escape(m.group(0))}]({urls[m.group(1).lower()]})"
+
+    return pattern.sub(link, text)
+
+
+def normalize_bullets(text: str) -> str:
+    """Put inline ' * item' bullets on their own lines so markdown renders a list.
+
+    Only a '*' that follows sentence punctuation counts, so "2 * 3" is left
+    alone. A blank line is inserted before a list that follows prose.
+    """
+    text = re.sub(r"(?<=[:.!?;)\"\u201d]) \* (?=\S)", "\n* ", text)
+    lines, out = text.split("\n"), []
+    for line in lines:
+        if line.startswith("* ") and out and out[-1].strip() and not re.match(r"\s*[*\-] ", out[-1]):
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
 
 
 def parse_chart_segments(text: str) -> list[tuple[str, str]]:
@@ -246,7 +306,7 @@ worker_status_info: dict | None = None  # Latest status from worker
 pending_jobs: dict[str, asyncio.Queue] = {}  # job_id -> queue of messages
 
 # Server-side buffer for in-progress jobs so page reloads can resume
-# job_id -> {"text": str, "done": bool, "error": str|None, "num_sources": int, "subscribers": set[asyncio.Event]}
+# job_id -> {"text": str, "done": bool, "error": str|None, "num_sources": int, "sources": list[dict], "events": set[asyncio.Event]}
 active_jobs: dict[str, dict] = {}
 JOB_BUFFER_TTL = 600  # seconds a finished job stays resumable after the last update
 
@@ -287,7 +347,7 @@ async def worker_endpoint(ws: WebSocket):
             if msg_type == "status":
                 worker_status_info = msg
 
-            elif msg_type in ("chunk", "done", "error"):
+            elif msg_type in ("sources", "chunk", "done", "error"):
                 job_id = msg.get("id")
                 if job_id and job_id in pending_jobs:
                     await pending_jobs[job_id].put(msg)
@@ -343,6 +403,7 @@ def _ensure_job_buffer(job_id: str) -> dict:
             "done": False,
             "error": None,
             "num_sources": 0,
+            "sources": [],
             "events": set(),
         }
     return active_jobs[job_id]
@@ -354,7 +415,9 @@ async def start_buffered_job(job: dict):
     buf = _ensure_job_buffer(job_id)
 
     async for msg in send_job(job):
-        if msg["type"] == "chunk":
+        if msg["type"] == "sources":
+            buf["sources"] = msg.get("sources", [])
+        elif msg["type"] == "chunk":
             buf["text"] += msg.get("text", "")
             buf["num_sources"] = msg.get("num_sources", 0)
         elif msg["type"] == "error":
@@ -378,11 +441,15 @@ async def follow_job(job_id: str):
         return
 
     last_len = 0
+    sources_sent = False
     event = asyncio.Event()
     buf["events"].add(event)
 
     try:
         while True:
+            if buf["sources"] and not sources_sent:
+                sources_sent = True
+                yield {"type": "sources", "sources": buf["sources"]}
             current_text = buf["text"]
             if len(current_text) > last_len:
                 yield {
@@ -727,6 +794,7 @@ def main_page():
     # --- Restore previous session ---
     saved_question = app.storage.user.get("last_question", "")
     saved_result = app.storage.user.get("last_result", "")
+    saved_sources = app.storage.user.get("last_sources", [])
     active_job_id = app.storage.user.get("active_job_id")
 
     # --- Main content ---
@@ -886,7 +954,19 @@ def main_page():
             result_stream.set_visibility(False)
             result_container = ui.column().classes("w-full gap-4")
             result_container.set_visibility(False)
+            sources_box = ui.column().classes("w-full gap-1 q-mt-md vr-sources")
+            sources_box.set_visibility(False)
         result_card.set_visibility(False)
+
+        # Links in answers lead to vr.se; open them in a new tab.
+        ui.add_body_html(
+            """<script>
+            document.addEventListener('click', function(e) {
+                var a = e.target.closest && e.target.closest('.vr-result a[href^="http"]');
+                if (a) { a.target = '_blank'; a.rel = 'noopener'; }
+            });
+            </script>"""
+        )
 
         def _clear_result():
             """Hide both result views and clear content."""
@@ -894,23 +974,46 @@ def main_page():
             result_stream.set_visibility(False)
             result_container.clear()
             result_container.set_visibility(False)
+            sources_box.clear()
+            sources_box.set_visibility(False)
             result_card.set_visibility(False)
+
+        def _render_sources(sources: list[dict]):
+            """List the cited documents with links to the search on vr.se."""
+            sources_box.clear()
+            if not sources:
+                sources_box.set_visibility(False)
+                return
+            with sources_box:
+                ui.label("Källor").classes("text-subtitle2").style("font-weight: 600;")
+                for src in sources:
+                    bits = [b for b in (src.get("doc_type") if src.get("doc_type") not in ("", "okänd") else "", src.get("year"), f"dnr {src['diarienummer']}" if src.get("diarienummer") else "") if b]
+                    with ui.row().classes("items-baseline gap-2 no-wrap"):
+                        ui.link(_doc_stem(src["filename"]), source_url(src), new_tab=True).classes("vr-link")
+                        if bits:
+                            ui.label("(" + ", ".join(str(b) for b in bits) + ")").classes("text-caption opacity-70")
+            sources_box.set_visibility(True)
 
         def _is_dark() -> bool:
             return dark.value is True or (
                 dark.value is None and app.storage.browser.get("dark_mode")
             )
 
-        def _render_final(text: str):
+        def _render_final(text: str, sources: list[dict] | None = None):
             """Parse text for chart blocks and render mixed markdown + Plotly."""
+            sources = sources or []
             result_stream.set_visibility(False)
             result_container.clear()
-            segments = parse_chart_segments(text)
+            segments = [
+                ("md", linkify_sources(normalize_bullets(content), sources)) if kind == "md" else (kind, content)
+                for kind, content in parse_chart_segments(text)
+            ]
             has_charts = any(s[0] == "chart" for s in segments)
+            _render_sources(sources)
 
             if not has_charts:
                 # No charts — just show as markdown in the card
-                result_stream.set_content(text)
+                result_stream.set_content(segments[0][1] if segments else "")
                 result_stream.set_visibility(True)
                 result_container.set_visibility(False)
                 result_card.set_visibility(True)
@@ -955,15 +1058,18 @@ def main_page():
         async def _follow_and_display(job_id: str, question_label: str):
             """Stream results from a buffered job into the UI."""
             full_text = ""
+            sources: list[dict] = []
             async for msg in follow_job(job_id):
-                if msg["type"] == "chunk":
+                if msg["type"] == "sources":
+                    sources = msg["sources"]
+                elif msg["type"] == "chunk":
                     num_sources = msg.get("num_sources", 0)
                     result_step.set_text("Steg 3/3 — Genererar svar")
                     result_detail.set_text(
                         f"Hittade {num_sources} relevanta dokument. Skriver svar..."
                     )
                     full_text = msg["text"]
-                    result_stream.set_content(full_text)
+                    result_stream.set_content(normalize_bullets(full_text))
                     result_stream.set_visibility(True)
                     result_card.set_visibility(True)
                 elif msg["type"] == "error":
@@ -971,8 +1077,9 @@ def main_page():
                     result_stream.set_visibility(True)
                     result_card.set_visibility(True)
                 elif msg["type"] == "done":
-                    _render_final(full_text)
+                    _render_final(full_text, sources)
                     app.storage.user["last_result"] = full_text
+                    app.storage.user["last_sources"] = sources
                     app.storage.user.pop("active_job_id", None)
                     progress_row.set_visibility(False)
 
@@ -991,7 +1098,7 @@ def main_page():
             analyse_btn.disable()
             asyncio.create_task(_resume_job())
         elif saved_result:
-            _render_final(saved_result)
+            _render_final(saved_result, saved_sources)
 
 
 VR_FAVICON = (

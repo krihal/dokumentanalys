@@ -551,6 +551,29 @@ def _save_full_texts(full_texts: dict[str, str]) -> None:
     tmp.replace(FULL_TEXTS_PATH)
 
 
+MANIFEST_KEYS = ("url", "page_url")
+
+
+def load_manifest(pdf_dir: str | Path | None) -> dict[str, dict]:
+    """filename -> {"url": ..., "page_url": ...} from manifest.json, written by the
+    vr.se downloader. RAG_MANIFEST overrides the default <pdf_dir>/manifest.json."""
+    path = os.environ.get("RAG_MANIFEST") or (Path(pdf_dir).expanduser() / "manifest.json" if pdf_dir else None)
+    if not path or not Path(path).exists():
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    out = {}
+    for name, entry in raw.items():
+        fields = {}
+        if entry.get("url"):
+            fields["url"] = entry["url"]
+        if entry.get("page"):
+            fields["page_url"] = entry["page"]
+        if fields:
+            out[name] = fields
+    return out
+
+
 def _load_full_texts() -> dict[str, str]:
     if FULL_TEXTS_PATH.exists():
         with open(FULL_TEXTS_PATH) as f:
@@ -567,6 +590,9 @@ def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | No
     """Ingest all PDFs from a directory into ChromaDB, full_texts.json and BM25."""
     t_start = time.time()
     pdf_path = Path(pdf_dir).expanduser()
+    manifest = load_manifest(pdf_path)
+    if manifest:
+        console.print(f"Manifest: källänkar för {len(manifest)} filer")
     if not pdf_path.exists():
         console.print(f"[red]Mappen hittades inte: {pdf_dir}[/red]")
         sys.exit(1)
@@ -667,6 +693,7 @@ def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | No
                 continue
 
             metadata = extract_metadata(text, pdf_file.name, pages=len(pages))
+            metadata.update(manifest.get(pdf_file.name, {}))
             chunks = fit_to_token_limit(structural_chunk(text), tokenizer, MAX_TOKENS)
             if not chunks:
                 no_text.append(pdf_file.name)
@@ -734,12 +761,14 @@ def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | No
     console.print(f"Fulltexter: {FULL_TEXTS_PATH} ({len(full_texts)} dokument)")
 
 
-def refresh_metadata() -> int:
+def refresh_metadata(pdf_dir: str | None = None) -> int:
     """Recompute document metadata from stored full texts and update ChromaDB.
 
     Lets metadata heuristics improve without re-extracting or re-embedding.
+    Source links are taken from manifest.json if available (see load_manifest).
     Returns the number of documents updated.
     """
+    manifest = load_manifest(pdf_dir)
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     collection = client.get_collection(COLLECTION_NAME)
     full_texts = _load_full_texts()
@@ -752,7 +781,8 @@ def refresh_metadata() -> int:
         if text is None:
             continue
         new = extract_metadata(text, meta["filename"], pages=meta.get("pages", 0))
-        keys = ("date", "diarienummer", "year", "language", "doc_type", "decision_type", "title", "pages")
+        new.update(manifest.get(meta["filename"], {}))
+        keys = ("date", "diarienummer", "year", "language", "doc_type", "decision_type", "title", "pages") + MANIFEST_KEYS
         if all(meta.get(k) == new.get(k) for k in keys):
             continue
         total = int(meta["total_chunks"])
@@ -775,12 +805,12 @@ def main():
     parser.add_argument("--ocr", action="store_true", help="OCR:a sidor som saknar textlager (kräver tesseract)")
     parser.add_argument("--limit", type=int, default=None, help="Bearbeta bara de N första filerna (test)")
     parser.add_argument("--rebuild-bm25", action="store_true", help="Bygg bara om BM25-indexet från databasen")
-    parser.add_argument("--refresh-metadata", action="store_true", help="Räkna om metadata från lagrade fulltexter utan ny inbäddning")
+    parser.add_argument("--refresh-metadata", action="store_true", help="Räkna om metadata från lagrade fulltexter utan ny inbäddning (läser även manifest.json i PDF-mappen)")
     args = parser.parse_args()
     if not args.pdf_dir and not (args.rebuild_bm25 or args.refresh_metadata):
         parser.error("ange en PDF-mapp, --rebuild-bm25 eller --refresh-metadata")
     if args.refresh_metadata:
-        n = refresh_metadata()
+        n = refresh_metadata(args.pdf_dir)
         console.print(f"[green]Klart.[/green] Metadata uppdaterad för {n} dokument")
         return
     if args.rebuild_bm25:

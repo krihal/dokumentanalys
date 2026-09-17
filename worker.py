@@ -16,6 +16,7 @@ Protocol (JSON over WebSocket):
     UI -> Worker:  {"type": "ask",     "id": "...", "question": "..."}
     UI -> Worker:  {"type": "ask-pdf", "id": "...", "pdf_base64": "..."}
     Worker -> UI:  {"type": "status",  "chunks": N, "model": "..."}
+    Worker -> UI:  {"type": "sources", "id": "...", "sources": [{"filename": ..., "year": ...}, ...]}
     Worker -> UI:  {"type": "chunk",   "id": "...", "text": "...", "num_sources": N}
     Worker -> UI:  {"type": "done",    "id": "..."}
     Worker -> UI:  {"type": "error",   "id": "...", "message": "..."}
@@ -34,8 +35,11 @@ import threading
 
 # Disable telemetry and analytics before importing any third-party libraries
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# huggingface_hub and transformers freeze these into constants at import time,
+# so they must be decided here, not inside download_models().
+if "--download" not in sys.argv:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["DO_NOT_TRACK"] = "1"
 os.environ["ANONYMIZED_TELEMETRY"] = "False"  # ChromaDB
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -344,6 +348,32 @@ def _doc_header(meta: dict) -> str:
     return " | ".join(bits)
 
 
+def _source_entry(meta: dict) -> dict:
+    """Metadata the UI needs to list and link a source document."""
+    return {
+        "filename": meta.get("filename", "okänd"),
+        "title": meta.get("title") or "",
+        "doc_type": meta.get("doc_type") or "",
+        "year": meta.get("year"),
+        "diarienummer": meta.get("diarienummer") or "",
+        "url": meta.get("url") or "",
+        "page_url": meta.get("page_url") or "",
+    }
+
+
+def _unique_sources(hits: list[dict]) -> list[dict]:
+    """One entry per document, in hit order."""
+    seen, out = set(), []
+    for hit in hits:
+        meta = hit["metadata"]
+        filename = meta.get("filename", "okänd")
+        if filename in seen:
+            continue
+        seen.add(filename)
+        out.append(_source_entry(meta))
+    return out
+
+
 def _fetch_windows(source: str, centers: list[int], total: int, radius: int) -> list[tuple[int, str]]:
     """Fetch chunks around each hit by id; merged, ordered by chunk index."""
     wanted = set()
@@ -448,20 +478,21 @@ def text_search(terms: list[str], case_sensitive: bool = False) -> list[dict]:
     return results
 
 
-def retrieve_broad(query: str, top_k: int = 50) -> tuple[str, int]:
-    """Broader retrieval for aggregate/analytical questions."""
+def retrieve_broad(query: str, top_k: int = 50) -> tuple[str, list[dict]]:
+    """Broader retrieval for aggregate/analytical questions. Returns (context, sources)."""
     vector_hits = vector_search(query, top_k=min(top_k, 100))
     bm25_hits = bm25_search(query, top_k=min(top_k, 100))
     candidates = merge_and_deduplicate(vector_hits, bm25_hits)
 
     if not candidates:
-        return "", 0
+        return "", []
 
     ranked = rerank(query, candidates, top_k=top_k)
     if not ranked:
-        return "", 0
+        return "", []
 
     # For analytical questions, list all matching documents with brief excerpts
+    sources: list[dict] = []
     seen_sources = set()
     context_parts = []
     total_chars = 0
@@ -470,17 +501,18 @@ def retrieve_broad(query: str, top_k: int = 50) -> tuple[str, int]:
         filename = hit["metadata"].get("filename", "okänd")
         if filename in seen_sources:
             continue
-        seen_sources.add(filename)
         score = hit.get("rerank_score", hit.get("score", 0))
         excerpt = hit["text"][:300].replace("\n", " ")
         entry = f"### {filename} (relevans: {score:.2f})\n{excerpt}..."
         if total_chars + len(entry) > MAX_CONTEXT_CHARS:
             break
+        seen_sources.add(filename)
+        sources.append(_source_entry(hit["metadata"]))
         context_parts.append(entry)
         total_chars += len(entry)
 
     context = "\n\n".join(context_parts)
-    return context, len(seen_sources)
+    return context, sources
 
 
 import re as _re
@@ -594,29 +626,26 @@ def _extract_search_terms(question: str) -> list[str]:
     return []
 
 
-def retrieve(query: str, max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, int]:
-    """Full retrieval pipeline: hybrid search -> rerank -> expand context."""
+def retrieve(query: str, max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, list[dict]]:
+    """Full retrieval pipeline: hybrid search -> rerank -> expand context. Returns (context, sources)."""
     # Step 1: Hybrid search
     vector_hits = vector_search(query)
     bm25_hits = bm25_search(query)
     candidates = merge_and_deduplicate(vector_hits, bm25_hits)
 
     if not candidates:
-        return "", 0
+        return "", []
 
     # Step 2: Re-rank
     ranked = rerank(query, candidates)
 
     if not ranked:
-        return "", 0
-
-    # Count unique sources
-    seen_sources = {h["metadata"].get("filename", "") for h in ranked}
+        return "", []
 
     # Step 3: Expand context
     context = expand_context(ranked, max_chars=max_chars)
 
-    return context, len(seen_sources)
+    return context, _unique_sources(ranked)
 
 
 def _llm_headers() -> dict:
@@ -691,7 +720,11 @@ def llm_list_models() -> list[str]:
 
 
 def process_question(question: str, model: str = ""):
-    """Generator yielding (num_sources, token) tuples."""
+    """Generator yielding (sources, num_sources, token) tuples.
+
+    sources lists the cited documents; num_sources may exceed len(sources)
+    for aggregate answers, where the count comes from metadata.
+    """
     model = model or MODEL
     analytical = _is_analytical(question)
     aggregate = _is_aggregate(question)
@@ -701,9 +734,12 @@ def process_question(question: str, model: str = ""):
 
     # Build text search results if we have explicit search terms
     text_search_context = ""
+    text_search_sources: list[dict] = []
     if search_terms:
         ts_results = text_search(search_terms)
         if ts_results:
+            by_name = {m.get("filename"): m for m in doc_table}
+            text_search_sources = [_source_entry(by_name.get(r["filename"], {"filename": r["filename"]})) for r in ts_results[:50]]
             parts = [f"**Textsökning för {search_terms}:** {len(ts_results)} dokument matchade.\n"]
             for r in ts_results[:50]:
                 match_info = ", ".join(f'"{t}": {c} träffar' for t, c in r["matches"].items())
@@ -714,14 +750,18 @@ def process_question(question: str, model: str = ""):
 
     # Retrieve with broader scope for analytical questions
     if aggregate and not search_terms:
-        context, num_sources = "", stats_docs  # metadata answers the question
+        context, sources = "", []  # metadata answers the question
     elif analytical:
-        context, num_sources = retrieve_broad(question)
+        context, sources = retrieve_broad(question)
     else:
-        context, num_sources = retrieve(question)
+        context, sources = retrieve(question)
+
+    seen = {s["filename"] for s in sources}
+    sources += [s for s in text_search_sources if s["filename"] not in seen]
+    num_sources = len(sources) or stats_docs
 
     if not context and not text_search_context and not stats:
-        yield num_sources, "Inga relevanta dokument hittades i databasen."
+        yield sources, num_sources, "Inga relevanta dokument hittades i databasen."
         return
 
     # Build prompt
@@ -763,11 +803,11 @@ def process_question(question: str, model: str = ""):
         {"role": "user", "content": user_prompt},
     ]
     for piece in llm_chat_stream(model, messages):
-        yield num_sources, piece
+        yield sources, num_sources, piece
 
 
 def process_pdf(pdf_base64: str, model: str = ""):
-    """Generator yielding (num_sources, token) tuples."""
+    """Generator yielding (sources, num_sources, token) tuples."""
     model = model or MODEL
     pdf_bytes = base64.b64decode(pdf_base64)
 
@@ -779,13 +819,13 @@ def process_pdf(pdf_base64: str, model: str = ""):
         with fitz.open(tmp_path) as doc:
             pdf_text = clean_pages([page.get_text() for page in doc])
     except Exception as ex:
-        yield 0, f"Kunde inte läsa PDF:en: {ex}"
+        yield [], 0, f"Kunde inte läsa PDF:en: {ex}"
         return
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
     if not pdf_text.strip():
-        yield 0, "Ingen text kunde extraheras från PDF:en. Filen kan vara skannad utan OCR."
+        yield [], 0, "Ingen text kunde extraheras från PDF:en. Filen kan vara skannad utan OCR."
         return
 
     # Use first chunks as search query
@@ -798,10 +838,10 @@ def process_pdf(pdf_base64: str, model: str = ""):
     if len(pdf_text) > PDF_MAX_CHARS:
         pdf_excerpt += "\n\n[...dokumentet fortsätter...]"
 
-    context, num_sources = retrieve(search_text, max_chars=MAX_CONTEXT_CHARS - len(pdf_excerpt))
+    context, sources = retrieve(search_text, max_chars=MAX_CONTEXT_CHARS - len(pdf_excerpt))
 
     if not context:
-        yield 0, "Inga relevanta dokument hittades i databasen."
+        yield [], 0, "Inga relevanta dokument hittades i databasen."
         return
 
     user_prompt = f"""## Dokument från databasen (Kontext)
@@ -824,7 +864,7 @@ Analysera det uppladdade dokumentet ovan och ge ett utlåtande baserat på Veten
         {"role": "user", "content": user_prompt},
     ]
     for piece in llm_chat_stream(model, messages):
-        yield num_sources, piece
+        yield sources, len(sources), piece
 
 
 _STREAM_END = object()
@@ -884,7 +924,11 @@ async def handle_job(ws, msg: dict):
             )
             return
 
-        async for num_sources, token in gen:
+        sources_sent = False
+        async for sources, num_sources, token in gen:
+            if not sources_sent:
+                sources_sent = True
+                await ws.send(json.dumps({"type": "sources", "id": job_id, "sources": sources}))
             await ws.send(
                 json.dumps(
                     {
@@ -960,11 +1004,10 @@ async def connect(url: str):
 
 
 def download_models():
-    """Download embedding and re-ranking models for offline use."""
-    # Temporarily allow network access
-    os.environ.pop("HF_HUB_OFFLINE", None)
-    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    """Download embedding and re-ranking models for offline use.
 
+    Network access is enabled at the top of the module when --download is given.
+    """
     log.info("Downloading embedding model: %s...", EMBED_MODEL)
     load_embed_model()
     log.info("Downloading re-ranking model: %s...", RERANK_MODEL)
