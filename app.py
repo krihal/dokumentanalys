@@ -2160,7 +2160,7 @@ async def main_page():
             ui.label("Vad vill du veta om dina dokument?").classes("vr-greeting")
             ui.label(
                 "Dina dokument lagras krypterade med din egen nyckel. "
-                "Ladda upp PDF- eller DOCX-filer och ställ frågor om dem."
+                "Ladda upp PDF-, DOCX-, HTML- eller ZIP-filer och ställ frågor om dem."
             ).classes("vr-greeting-sub")
             with ui.row().classes("justify-center gap-2 q-mt-md"):
                 for example in (

@@ -6,6 +6,8 @@ frågor om dem. Hybrid sökning (multilingual-e5-small + BM25) → multilingual
 re-ranker → LLM. Webbgränssnitt i NiceGUI, modellarbetet i en separat worker
 som kan köras på en annan maskin.
 
+Användarguide med skärmbilder: [docs/anvandarguide.md](docs/anvandarguide.md).
+
 ## Komponenter
 
 | Fil | Roll |
@@ -20,18 +22,27 @@ som kan köras på en annan maskin.
 ## Säkerhetsmodell
 
 **Konton.** Administratören skapar konton (`users.py add`). Första inloggningen
-kräver nytt lösenord och därefter en lösenfras. Lösenordet lagras som
-Argon2id-hash. Ett konto spärras i 15 minuter efter fem felaktiga lösenord
-eller lösenfraser; en IP-adress efter 30 (bakom en reverse proxy: sätt
+kräver ett eget lösenord; det är allt användaren behöver. Lösenordet lagras
+som Argon2id-hash. Ett konto spärras i 15 minuter efter fem felaktiga
+lösenord; en IP-adress efter 30 (bakom en reverse proxy: sätt
 `TRUSTED_PROXIES` så att klientens riktiga adress används). Vid inloggning får
 webbläsaren ett nytt sessions-id. En session upphör så fort lösenordet eller
 nycklarna ändras någon annanstans (även via `users.py reset-password`) eller
 kontot tas bort.
 
 **Nycklar.** Varje användare har ett X25519-nyckelpar. Den privata nyckeln är
-krypterad (XChaCha20-Poly1305) med en nyckel härledd ur lösenfrasen
-(Argon2id, 256 MiB). Lösenfrasen lagras inte och **kan inte återställas** —
-glöms den är dokumenten förlorade. Den kan bytas under Dokument → Konto.
+krypterad (XChaCha20-Poly1305) med en nyckel härledd ur **lösenordet**
+(Argon2id, 256 MiB, eget salt, skilt från inloggningshashen så att den lagrade
+hashen inte låser upp nyckeln). Lösenordet lagras inte. Byts det under
+Dokument → Konto låses nyckeln om med det nya och dokumenten finns kvar.
+
+Avvägning: ett lösenord i stället för lösenord + lösenfras gör det enklare,
+men dokumentens skydd är nu aldrig starkare än lösenordet, och den som får
+tag i lösenordet (återanvänt, nätfiskat) kommer åt dokumenten. **Ett glömt
+lösenord kan inte återställas utan att dokumenten går förlorade**:
+`users.py reset-password` raderar användarens nyckel och alla dokument.
+Konton från tidigare version (med separat lösenfras) får ange lösenfrasen en
+sista gång vid nästa inloggning; därefter räcker lösenordet.
 
 **Dokument.** Varje dokument får en slumpad 256-bitars nyckel som förseglas med
 användarens publika nyckel. Sökindexet (text, avsnitt, metadata,
@@ -43,8 +54,7 @@ dokument hen ska titta i; källistan visas alltid. Filnamn och metadata finns
 bara inuti de krypterade blobbarna. Att ta bort ett dokument raderar dess
 nyckel (SQLite `secure_delete`), vilket gör resterna oläsbara.
 
-**Under en session.** Efter inloggning låser användaren upp nyckeln med
-lösenfrasen. Nyckeln och det dekrypterade indexet finns då bara i appens
+**Under en session.** Vid inloggning låser lösenordet upp nyckeln. Nyckeln och det dekrypterade indexet finns då bara i appens
 minne, kopplade till webbläsarsessionen, och släpps vid utloggning, efter
 `SESSION_IDLE_MINUTES` utan aktivitet, efter `SESSION_MAX_HOURS` och vid
 omstart.
@@ -116,7 +126,7 @@ uv run worker.py --download   # inbäddnings- och re-rankingmodeller
 ```
 uv run users.py add alice               # skriver ut ett tillfälligt lösenord
 uv run users.py list
-uv run users.py reset-password alice    # nytt tillfälligt lösenord; lösenfrasen påverkas inte
+uv run users.py reset-password alice    # nytt tillfälligt lösenord; RADERAR alices nyckel och dokument
 uv run users.py delete alice            # tar bort kontot och alla dokument
 uv run users.py import alice ~/vr/vr_pdfs   # kryptera in en hel mapp (efter alices första inloggning)
 ```
