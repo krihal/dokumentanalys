@@ -2,8 +2,8 @@
 
 Security model (see README):
   * Accounts are created by an admin (users.py). First login forces a new
-    password, then a passphrase that protects the user's private key.
-  * The private key is unlocked with the passphrase at every login and
+    password, which also protects the user's private key (vault.py).
+  * The private key is unlocked with the password at every login and
     lives only in this process's memory, for this browser session. It is
     dropped on logout, after SESSION_IDLE_MINUTES of inactivity, after
     SESSION_MAX_HOURS, and on restart. Nothing decrypted is written to disk.
@@ -324,14 +324,16 @@ _PLOTLY_THEME_JS = """
 # Keyed by NiceGUI's browser id, which lives only in the signed session cookie.
 # Nothing session-related is written to app.storage.user (that is a file).
 
-STAGE_PAGES = {"password": "/password", "setup": "/setup", "unlock": "/unlock", "ready": "/"}
+# "password": must replace a temporary password; "unlock": legacy account, one
+# last passphrase entry to move its key to the password; "ready": key unlocked.
+STAGE_PAGES = {"password": "/password", "unlock": "/unlock", "ready": "/"}
 
 
 @dataclass
 class Session:
     user_id: int
     username: str
-    stage: str  # "password" (must change), "setup" (no key pair yet), "unlock", "ready"
+    stage: str  # see STAGE_PAGES
     created: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
     key: PrivateKey | None = None
@@ -344,6 +346,8 @@ class Session:
     saving: int = 0  # vault writes in progress; they are never interrupted
     receiving: bool = False  # an upload body is being read (one at a time)
     auth_fp: bytes = b""  # fingerprint of password hash + wrapped key when the session was granted
+    migration: tuple[bytes, bytes] | None = None  # legacy account: (kek, salt) from the password, until converted
+    changing_auth: bool = False  # this session is changing its own password/key; skip the stale-credentials check
 
     def touch(self) -> None:
         self.last_seen = time.monotonic()
@@ -356,6 +360,7 @@ class Session:
         """Drop the key and everything decrypted. Python cannot zero memory,
         but without references the garbage collector frees it."""
         self.key = None
+        self.migration = None
         self.index = None
         self.turns = []
         for entry in self.uploads.values():
@@ -379,6 +384,18 @@ def auth_fingerprint(user) -> bytes:
     return hashlib.sha256(bytes(user["pw_hash"]) + b"|" + bytes(user["wrapped_private_key"] or b"")).digest()
 
 
+async def own_auth_change(s: Session, fn, *args):
+    """Run a change of this session's own password or key (in a thread) and
+    adopt the new credentials, without the session invalidating itself midway."""
+    s.changing_auth = True
+    try:
+        result = await run.io_bound(fn, *args)
+        refresh_auth(s)
+        return result
+    finally:
+        s.changing_auth = False
+
+
 def refresh_auth(s: Session) -> None:
     """After this session itself changed password or keys: keep it, end the others."""
     s.auth_fp = auth_fingerprint(vault.get_user(s.user_id))
@@ -387,6 +404,8 @@ def refresh_auth(s: Session) -> None:
 def _still_valid(s: Session) -> bool:
     """False once the password was changed or reset elsewhere, the key pair
     re-wrapped, or the account deleted (also from users.py)."""
+    if s.changing_auth:
+        return True
     fp = auth_fingerprint(vault.get_user(s.user_id))
     return bool(fp) and secrets.compare_digest(fp, s.auth_fp)
 
@@ -503,7 +522,7 @@ def guard(*stages: str) -> tuple[Session | None, Response | None]:
 class Throttle:
     """Failed-attempt counter: after `limit` failures within WINDOW seconds, locked for LOCK seconds.
 
-    Keys: "u:<username>" (login, 5 tries), "k:<user id>" (passphrase, 5 tries) and
+    Keys: "u:<username>" (login, 5 tries), "k:<user id>" (legacy passphrase, 5 tries) and
     "ip:<address>" (login, IP_LIMIT tries: a loose limit, since many users can
     share an address)."""
 
@@ -1539,7 +1558,7 @@ def _session_watch() -> None:
 
 
 def _auth_card(title: str, subtitle: str = ""):
-    """Centered card used by the login, password, passphrase and unlock pages."""
+    """Centered card used by the login, password and unlock pages."""
     col = ui.column().classes("absolute-center items-center")
     with col:
         card = ui.card().classes("w-96 vr-card vr-login-card")
@@ -1567,6 +1586,26 @@ async def _busy(button: ui.button, coro):
         return await coro
     finally:
         button.enable()
+
+
+def _open_account(s: Session, user, password: str) -> None:
+    """After a correct password: unlock the key with it (creating the key pair
+    on first use), or prepare the one-time move of a legacy passphrase account.
+    Sets the session's stage. Runs Argon2id: call from a thread."""
+    if user["must_change_pw"]:
+        s.stage = "password"
+    elif not vault.has_keys(user):
+        s.key = vault.create_keys(user["id"], password)
+        s.stage = "ready"
+    elif vault.password_is_key(user):
+        s.key = vault.unlock(user["id"], password)
+        if s.key is None:
+            raise vault.VaultError("Kontots nyckel kunde inte låsas upp.")
+        s.stage = "ready"
+    else:
+        s.migration = vault.password_kek(password)
+        s.stage = "unlock"
+    s.auth_fp = auth_fingerprint(vault.get_user(user["id"]))
 
 
 @ui.page("/login")
@@ -1597,8 +1636,9 @@ def login_page(request: Request):
             if throttle.locked(ip_key) or throttle.locked(user_key):
                 error.set_text("För många misslyckade försök. Försök igen om en stund.")
                 return
-            user = await _busy(button, run.io_bound(vault.verify_login, name, password.value or ""))
+            secret = password.value or ""
             password.set_value("")
+            user = await _busy(button, run.io_bound(vault.verify_login, name, secret))
             if not user:
                 throttle.fail(ip_key, Throttle.IP_LIMIT)
                 throttle.fail(user_key)
@@ -1608,8 +1648,14 @@ def login_page(request: Request):
             if throttle.locked(f"k:{user['id']}"):
                 error.set_text("Kontot är tillfälligt spärrat efter för många felaktiga lösenfraser.")
                 return
-            stage = "password" if user["must_change_pw"] else ("unlock" if vault.has_keys(user) else "setup")
-            session = Session(user_id=user["id"], username=user["username"], stage=stage, auth_fp=auth_fingerprint(user))
+            session = Session(user_id=user["id"], username=user["username"], stage="password")
+            try:
+                await _busy(button, run.io_bound(_open_account, session, user, secret))
+            except vault.VaultError as ex:
+                error.set_text(str(ex))
+                return
+            finally:
+                secret = ""
             end_session()
             # Hand over through /login/complete, which issues a fresh session id
             # (a session id planted before login must not become a logged-in one).
@@ -1629,26 +1675,34 @@ def password_page():
         return redirect
     _page_setup()
     _session_watch()
-    with _auth_card("Välj nytt lösenord", f"Kontot {s.username} har ett tillfälligt lösenord. Välj ett eget på minst {vault.MIN_PASSWORD_LEN} tecken."):
+    with _auth_card(
+        "Välj lösenord",
+        f"Kontot {s.username} har ett tillfälligt lösenord. Välj ett eget på minst {vault.MIN_PASSWORD_LEN} tecken. "
+        "Det skyddar också nyckeln som krypterar dina dokument: glömmer du det kan dokumenten inte räddas.",
+    ):
         new = _secret_input("Nytt lösenord", "new-password")
         again = _secret_input("Upprepa lösenordet", "new-password")
         error = ui.label("").classes("text-red q-mt-sm")
 
         async def do_change():
-            if new.value != again.value:
-                error.set_text("Lösenorden är inte lika.")
-                return
+            secret = new.value or ""
             try:
-                await _busy(button, run.io_bound(vault.set_password, s.user_id, new.value or ""))
+                if secret != (again.value or ""):
+                    raise vault.VaultError("Lösenorden är inte lika.")
+                vault.check_password_policy(secret)
+
+                def apply():
+                    vault.set_password(s.user_id, secret)
+                    _open_account(s, vault.get_user(s.user_id), secret)
+
+                await _busy(button, own_auth_change(s, apply))
             except vault.VaultError as ex:
                 error.set_text(str(ex))
                 return
             finally:
                 new.set_value("")
                 again.set_value("")
-            refresh_auth(s)
-            user = vault.get_user(s.user_id)
-            s.stage = "unlock" if vault.has_keys(user) else "setup"
+                secret = ""
             ui.navigate.to(STAGE_PAGES[s.stage])
 
         again.on("keydown.enter", do_change)
@@ -1656,54 +1710,22 @@ def password_page():
         ui.button("Logga ut", on_click=_logout, color=None).props("flat no-caps").classes("w-full vr-btn vr-plain")
 
 
-@ui.page("/setup")
-def setup_page():
-    s, redirect = guard("setup")
-    if redirect:
-        return redirect
-    _page_setup()
-    _session_watch()
-    with _auth_card(
-        "Välj lösenfras",
-        "Lösenfrasen skyddar nyckeln som krypterar dina dokument. Den lagras inte någonstans och "
-        "kan inte återställas: glöms den är dokumenten förlorade för alltid. "
-        f"Använd minst {vault.MIN_PASSPHRASE_LEN} tecken, gärna flera ord, och inte ditt lösenord.",
-    ):
-        phrase = _secret_input("Lösenfras", "new-password")
-        again = _secret_input("Upprepa lösenfrasen", "new-password")
-        error = ui.label("").classes("text-red q-mt-sm")
-
-        async def do_setup():
-            try:
-                if phrase.value != again.value:
-                    raise vault.VaultError("Lösenfraserna är inte lika.")
-                vault.check_passphrase_policy(phrase.value or "")
-                if await run.io_bound(vault.verify_login, s.username, phrase.value):
-                    raise vault.VaultError("Lösenfrasen får inte vara samma som lösenordet.")
-                s.key = await _busy(button, run.io_bound(vault.create_keys, s.user_id, phrase.value))
-                refresh_auth(s)
-            except vault.VaultError as ex:
-                error.set_text(str(ex))
-                return
-            finally:
-                phrase.set_value("")
-                again.set_value("")
-            s.stage = "ready"
-            ui.navigate.to("/")
-
-        again.on("keydown.enter", do_setup)
-        button = _submit_button("Skapa nycklar", do_setup)
-        ui.button("Logga ut", on_click=_logout, color=None).props("flat no-caps").classes("w-full vr-btn vr-plain")
-
-
 @ui.page("/unlock")
 def unlock_page():
+    """Accounts from before the password became the key: the old passphrase once more."""
     s, redirect = guard("unlock")
     if redirect:
         return redirect
+    if s.migration is None:
+        end_session()
+        return RedirectResponse("/login")
     _page_setup()
     _session_watch()
-    with _auth_card("Lås upp", f"Ange lösenfrasen för {s.username} för att dekryptera dina dokument."):
+    with _auth_card(
+        "En sista gång",
+        f"Kontot {s.username} skapades med en separat lösenfras. Ange den en sista gång; "
+        "därefter låser ditt lösenord upp dokumenten och lösenfrasen behövs inte mer.",
+    ):
         phrase = _secret_input("Lösenfras", "current-password").props("autofocus")
         error = ui.label("").classes("text-red q-mt-sm")
 
@@ -1724,6 +1746,9 @@ def unlock_page():
                 error.set_text("Fel lösenfras.")
                 return
             throttle.reset(key_throttle)
+            kek, salt = s.migration
+            await own_auth_change(s, vault.protect_key_with_kek, s.user_id, key, kek, salt)
+            s.migration = None
             s.key = key
             s.stage = "ready"
             ui.navigate.to("/")
@@ -2562,7 +2587,7 @@ async def documents_page():
             ui.label(
                 "Nycklarna raderas först, så de krypterade filerna blir oläsbara för alltid. "
                 "Det går inte att ångra."
-                + (" Du loggas ut och kontot försvinner." if everything else " Kontot och lösenfrasen finns kvar.")
+                + (" Du loggas ut och kontot försvinner." if everything else " Kontot och lösenordet finns kvar.")
             ).classes("vr-greeting-sub")
             pw = _secret_input("Ditt lösenord", "current-password")
             word = ui.input(label="Skriv RADERA för att bekräfta").classes("w-full").props('autocomplete="off"')
@@ -2618,34 +2643,11 @@ async def documents_page():
     with ui.column().classes("w-full max-w-3xl mx-auto q-px-md q-pb-xl gap-2"):
         with ui.expansion("Konto och säkerhet", icon="lock").classes("w-full vr-card"):
             with ui.column().classes("w-full gap-2 q-pa-sm"):
-                ui.label("Byt lösenfras").classes("text-subtitle2").style("font-weight: 600;")
-                ui.label("Dokumenten behöver inte krypteras om; bara din privata nyckel skyddas med den nya frasen.").classes("text-caption opacity-70")
-                current = _secret_input("Nuvarande lösenfras", "current-password")
-                new = _secret_input("Ny lösenfras", "new-password")
-                again = _secret_input("Upprepa ny lösenfras", "new-password")
-
-                async def change_phrase():
-                    try:
-                        if new.value != again.value:
-                            raise vault.VaultError("Lösenfraserna är inte lika.")
-                        vault.check_passphrase_policy(new.value or "")
-                        key = await _busy(phrase_btn, run.io_bound(vault.unlock, s.user_id, current.value or ""))
-                        if key is None:
-                            throttle.fail(f"k:{s.user_id}")
-                            raise vault.VaultError("Fel nuvarande lösenfras.")
-                        await _busy(phrase_btn, run.io_bound(vault.change_passphrase, s.user_id, key, new.value))
-                        refresh_auth(s)  # other sessions of this account are ended
-                        ui.notify("Lösenfrasen är bytt. Andra inloggningar har loggats ut.")
-                    except vault.VaultError as ex:
-                        ui.notify(str(ex), type="negative")
-                    finally:
-                        for f in (current, new, again):
-                            f.set_value("")
-
-                phrase_btn = ui.button("Byt lösenfras", on_click=change_phrase).props('outline no-caps color="black"').classes("vr-btn")
-
-                ui.separator().classes("q-my-md")
                 ui.label("Byt lösenord").classes("text-subtitle2").style("font-weight: 600;")
+                ui.label(
+                    "Lösenordet skyddar också nyckeln till dina dokument; den låses om med det nya. "
+                    "Andra inloggningar loggas ut."
+                ).classes("text-caption opacity-70")
                 pw_current = _secret_input("Nuvarande lösenord", "current-password")
                 pw_new = _secret_input("Nytt lösenord", "new-password")
                 pw_again = _secret_input("Upprepa nytt lösenord", "new-password")
@@ -2654,11 +2656,15 @@ async def documents_page():
                     try:
                         if pw_new.value != pw_again.value:
                             raise vault.VaultError("Lösenorden är inte lika.")
+                        if throttle.locked(f"u:{s.username}"):
+                            raise vault.VaultError("För många misslyckade försök. Försök igen om en stund.")
                         if not await _busy(pw_btn, run.io_bound(vault.verify_login, s.username, pw_current.value or "")):
                             throttle.fail(f"u:{s.username}")
                             raise vault.VaultError("Fel nuvarande lösenord.")
-                        await run.io_bound(vault.set_password, s.user_id, pw_new.value or "")
-                        refresh_auth(s)  # other sessions of this account are ended
+                        if s.key is None:
+                            raise vault.VaultError("Nyckeln är låst. Logga in igen.")
+                        # Other sessions of this account are ended by the new credentials.
+                        await _busy(pw_btn, own_auth_change(s, vault.change_password, s.user_id, s.key, pw_new.value or ""))
                         ui.notify("Lösenordet är bytt. Andra inloggningar har loggats ut.")
                     except vault.VaultError as ex:
                         ui.notify(str(ex), type="negative")

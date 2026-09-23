@@ -2,17 +2,18 @@
 
     uv run users.py add <användare>             skapa konto med tillfälligt lösenord
     uv run users.py list
-    uv run users.py reset-password <användare>  nytt tillfälligt lösenord (lösenfrasen och dokumenten påverkas inte)
+    uv run users.py reset-password <användare>  nytt tillfälligt lösenord; raderar användarens nyckel och dokument
     uv run users.py delete <användare>          ta bort kontot och alla dess dokument
     uv run users.py import <användare> <mapp> [--ocr]
                                                 kryptera in alla PDF/DOCX/HTML i en mapp i användarens bibliotek
 
 The temporary password is printed once; the user must change it at first
-login and then chooses the passphrase that protects their key. A forgotten
-passphrase cannot be reset: the documents are then lost.
+login. Their own password then also protects the key that encrypts their
+documents, so a forgotten password cannot be reset without losing them:
+reset-password deletes the key and every document.
 
 `import` needs only the user's public key, so it works without the
-passphrase, but the user must have logged in once (key pair created). It
+password, but the user must have logged in once (key pair created). It
 loads the embedding model locally, like the worker.
 """
 
@@ -64,10 +65,18 @@ def cmd_list(_args):
 
 def cmd_reset(args):
     user = _require(args.username)
+    if vault.has_keys(user):
+        n = len(vault.list_documents(user["id"]))
+        print(f"Lösenordet skyddar {user['username']}s krypteringsnyckel. Ett nytt lösenord kan inte öppna den,")
+        print(f"så nyckeln och alla {n} dokument raderas permanent. Användaren börjar om med ett tomt bibliotek.")
+        answer = input("Skriv användarnamnet för att fortsätta: ")
+        if answer.strip().lower() != user["username"]:
+            sys.exit("Avbrutet.")
     password = _temp_password()
-    vault.set_password(user["id"], password, must_change=True)
+    n = vault.reset_password(user["id"], password)
     print(f"Tillfälligt lösenord för {user['username']} (visas bara nu): {password}")
-    print("Lösenfrasen är oförändrad; den kan inte återställas.")
+    if n:
+        print(f"{n} dokument raderades.")
 
 
 def cmd_delete(args):
@@ -82,7 +91,7 @@ def cmd_delete(args):
 def cmd_import(args):
     user = _require(args.username)
     if not vault.has_keys(user):
-        sys.exit("Användaren har inga nycklar ännu. Låt hen logga in och välja lösenfras först.")
+        sys.exit("Användaren har inga nycklar ännu. Låt hen logga in och välja lösenord först.")
     folder = Path(args.folder).expanduser()
     files = sorted(p for p in folder.glob("**/*") if p.suffix.lower() in (".pdf", ".docx", ".htm", ".html") and p.is_file())
     if not files:
@@ -114,7 +123,7 @@ def main():
     p.add_argument("--prompt", action="store_true", help="Ange tillfälligt lösenord själv i stället för att generera")
     p.set_defaults(fn=cmd_add)
     sub.add_parser("list", help="Lista konton").set_defaults(fn=cmd_list)
-    p = sub.add_parser("reset-password", help="Sätt nytt tillfälligt lösenord")
+    p = sub.add_parser("reset-password", help="Nytt tillfälligt lösenord (raderar nyckel och dokument)")
     p.add_argument("username")
     p.set_defaults(fn=cmd_reset)
     p = sub.add_parser("delete", help="Ta bort konto och dokument")

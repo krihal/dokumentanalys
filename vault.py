@@ -12,9 +12,13 @@ Cryptography (libsodium via PyNaCl):
 
   * Login password: Argon2id hash (nacl.pwhash.argon2id.str).
   * Every user has an X25519 key pair. The private key is encrypted with
-    XChaCha20-Poly1305 under a key derived from the user's passphrase with
-    Argon2id. The passphrase is never stored; without it the private key,
-    and therefore every document, is unreadable. It cannot be reset.
+    XChaCha20-Poly1305 under a key derived from the user's password with
+    Argon2id (own salt and a higher cost than the login hash, so the stored
+    hash does not unlock it). The password is never stored; without it the
+    private key, and therefore every document, is unreadable. An admin
+    password reset therefore deletes the user's documents and keys.
+    (Accounts from before used a separate passphrase, key_mode "passphrase";
+    they are moved to the password at their next login.)
   * Every document gets a random 256-bit data key. Its blobs are encrypted
     with XChaCha20-Poly1305 under that key, with the user id, document id and
     blob kind as associated data, so blobs cannot be swapped between
@@ -54,7 +58,6 @@ PW_OPS = nacl.pwhash.argon2id.OPSLIMIT_INTERACTIVE
 PW_MEM = nacl.pwhash.argon2id.MEMLIMIT_INTERACTIVE
 
 MIN_PASSWORD_LEN = 12
-MIN_PASSPHRASE_LEN = 16
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
 
 _NONCE = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
@@ -73,6 +76,7 @@ CREATE TABLE IF NOT EXISTS users (
     kdf_salt BLOB,
     kdf_ops INTEGER,
     kdf_mem INTEGER,
+    key_mode TEXT NOT NULL DEFAULT 'passphrase',
     created REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS documents (
@@ -115,6 +119,10 @@ def init() -> int:
         BLOB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     finally:
         os.umask(old)
+    with closing(_connect()) as conn, conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "key_mode" not in columns:  # vaults created before the password became the key
+            conn.execute("ALTER TABLE users ADD COLUMN key_mode TEXT NOT NULL DEFAULT 'passphrase'")
     removed = 0
     for orig in BLOB_DIR.glob("*/*.orig"):
         orig.unlink(missing_ok=True)
@@ -182,13 +190,6 @@ def check_password_policy(password: str) -> None:
         raise VaultError(f"Lösenordet måste vara minst {MIN_PASSWORD_LEN} tecken.")
 
 
-def check_passphrase_policy(passphrase: str, password_hint: str = "") -> None:
-    if len(passphrase) < MIN_PASSPHRASE_LEN:
-        raise VaultError(f"Lösenfrasen måste vara minst {MIN_PASSPHRASE_LEN} tecken.")
-    if password_hint and passphrase == password_hint:
-        raise VaultError("Lösenfrasen får inte vara samma som lösenordet.")
-
-
 def create_user(username: str, password: str) -> int:
     username = username.strip().lower()
     if not USERNAME_RE.match(username):
@@ -238,6 +239,11 @@ def verify_login(username: str, password: str) -> sqlite3.Row | None:
 
 
 def set_password(user_id: int, password: str, must_change: bool = False) -> None:
+    """Set the login password of an account whose key does not depend on it.
+    (For an account with a password-protected key use change_password.)"""
+    user = get_user(user_id)
+    if user and has_keys(user) and user["key_mode"] == "password":
+        raise VaultError("Lösenordet skyddar kontots nyckel; använd change_password.")
     check_password_policy(password)
     pw_hash = nacl.pwhash.argon2id.str(password.encode(), opslimit=PW_OPS, memlimit=PW_MEM)
     with closing(_connect()) as conn, conn:
@@ -290,19 +296,27 @@ def has_keys(user: sqlite3.Row) -> bool:
     return user["public_key"] is not None
 
 
-def create_keys(user_id: int, passphrase: str) -> PrivateKey:
-    """Generate the user's key pair, wrap the private key with the passphrase.
+def password_is_key(user: sqlite3.Row) -> bool:
+    """True when the private key is protected by the login password (not a legacy passphrase)."""
+    return has_keys(user) and user["key_mode"] == "password"
+
+
+def _wrap(user_id: int, sk: PrivateKey, secret: str) -> tuple[bytes, bytes]:
+    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+    return _encrypt(_derive_kek(secret, salt, KDF_OPS, KDF_MEM), bytes(sk), _sk_aad(user_id)), salt
+
+
+def create_keys(user_id: int, password: str) -> PrivateKey:
+    """Generate the user's key pair and protect the private key with the password.
 
     Refuses to overwrite an existing key pair: that would orphan every document.
     """
     sk = PrivateKey.generate()
-    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
-    kek = _derive_kek(passphrase, salt, KDF_OPS, KDF_MEM)
-    wrapped = _encrypt(kek, bytes(sk), _sk_aad(user_id))
+    wrapped, salt = _wrap(user_id, sk, password)
     with closing(_connect()) as conn, conn:
         cur = conn.execute(
-            "UPDATE users SET public_key = ?, wrapped_private_key = ?, kdf_salt = ?, kdf_ops = ?, kdf_mem = ? "
-            "WHERE id = ? AND public_key IS NULL",
+            "UPDATE users SET public_key = ?, wrapped_private_key = ?, kdf_salt = ?, kdf_ops = ?, kdf_mem = ?, "
+            "key_mode = 'password' WHERE id = ? AND public_key IS NULL",
             (bytes(sk.public_key), wrapped, salt, KDF_OPS, KDF_MEM, user_id),
         )
         if cur.rowcount != 1:
@@ -310,12 +324,12 @@ def create_keys(user_id: int, passphrase: str) -> PrivateKey:
     return sk
 
 
-def unlock(user_id: int, passphrase: str) -> PrivateKey | None:
-    """The user's private key, or None if the passphrase is wrong."""
+def unlock(user_id: int, secret: str) -> PrivateKey | None:
+    """The user's private key, or None if the password (or legacy passphrase) is wrong."""
     user = get_user(user_id)
     if not user or not has_keys(user):
         return None
-    kek = _derive_kek(passphrase, user["kdf_salt"], user["kdf_ops"], user["kdf_mem"])
+    kek = _derive_kek(secret, user["kdf_salt"], user["kdf_ops"], user["kdf_mem"])
     try:
         raw = _decrypt(kek, user["wrapped_private_key"], _sk_aad(user_id))
     except nacl.exceptions.CryptoError:
@@ -326,16 +340,54 @@ def unlock(user_id: int, passphrase: str) -> PrivateKey | None:
     return sk
 
 
-def change_passphrase(user_id: int, sk: PrivateKey, new_passphrase: str) -> None:
-    """Re-wrap the private key under a new passphrase. Documents are untouched."""
+def password_kek(password: str) -> tuple[bytes, bytes]:
+    """(key-encryption key, salt) for a password, to re-wrap a key later
+    without keeping the password itself."""
     salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
-    kek = _derive_kek(new_passphrase, salt, KDF_OPS, KDF_MEM)
+    return _derive_kek(password, salt, KDF_OPS, KDF_MEM), salt
+
+
+def protect_key_with_kek(user_id: int, sk: PrivateKey, kek: bytes, salt: bytes) -> None:
+    """Move a legacy account to the password: re-wrap the key under the
+    password's key-encryption key (from password_kek). Documents are untouched."""
     wrapped = _encrypt(kek, bytes(sk), _sk_aad(user_id))
     with closing(_connect()) as conn, conn:
         conn.execute(
-            "UPDATE users SET wrapped_private_key = ?, kdf_salt = ?, kdf_ops = ?, kdf_mem = ? WHERE id = ?",
+            "UPDATE users SET wrapped_private_key = ?, kdf_salt = ?, kdf_ops = ?, kdf_mem = ?, key_mode = 'password' "
+            "WHERE id = ?",
             (wrapped, salt, KDF_OPS, KDF_MEM, user_id),
         )
+
+
+def change_password(user_id: int, sk: PrivateKey, new_password: str) -> None:
+    """New login password and the key re-wrapped under it, in one transaction.
+    Needs the unlocked key; documents stay readable."""
+    check_password_policy(new_password)
+    pw_hash = nacl.pwhash.argon2id.str(new_password.encode(), opslimit=PW_OPS, memlimit=PW_MEM)
+    wrapped, salt = _wrap(user_id, sk, new_password)
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET pw_hash = ?, must_change_pw = 0, wrapped_private_key = ?, kdf_salt = ?, kdf_ops = ?, "
+            "kdf_mem = ?, key_mode = 'password' WHERE id = ?",
+            (pw_hash, wrapped, salt, KDF_OPS, KDF_MEM, user_id),
+        )
+
+
+def reset_password(user_id: int, temporary_password: str) -> int:
+    """Admin reset. The key is protected by the old password, so it and every
+    document are deleted; the user starts over. Returns the documents deleted."""
+    check_password_policy(temporary_password)
+    pw_hash = nacl.pwhash.argon2id.str(temporary_password.encode(), opslimit=PW_OPS, memlimit=PW_MEM)
+    with closing(_connect()) as conn, conn:
+        n = conn.execute("DELETE FROM documents WHERE user_id = ?", (user_id,)).rowcount
+        conn.execute(
+            "UPDATE users SET pw_hash = ?, must_change_pw = 1, public_key = NULL, wrapped_private_key = NULL, "
+            "kdf_salt = NULL, kdf_ops = NULL, kdf_mem = NULL, key_mode = 'password' WHERE id = ?",
+            (pw_hash, user_id),
+        )
+    _remove_blob_dir(user_id)
+    _vacuum()
+    return n
 
 
 # ---------------------------------------------------------------------------
