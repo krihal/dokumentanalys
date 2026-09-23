@@ -61,8 +61,8 @@ till höger finns två flikar:
 
 ![Startsidan. Fliken Dokument är markerad.](bilder/03-startsida.png)
 
-Innan du kan ställa frågor behöver du ladda upp dokument. Klicka på
-**Dokument**.
+Innan du kan ställa frågor behöver du ladda upp dokument. Det gör du under
+**Dokument**, så klicka där.
 
 ---
 
@@ -74,8 +74,6 @@ På sidan **Dokument** klickar du på **Ladda upp** och väljer en eller flera
 filer. Du kan välja många filer på en gång, upp till 5 000.
 
 ![Dokumentsidan innan något är uppladdat. Knappen Ladda upp är markerad.](bilder/04-dokument-tom.png)
-
-Du kan också klicka på gemet (📎) i frågerutan på startsidan.
 
 **Filer som fungerar:**
 

@@ -1524,8 +1524,6 @@ body.body--dark .vr-logo-light { display: block; }
 .vr-upload-name { color: var(--vr-fg); font-size: 0.9rem; }
 .vr-upload-detail { color: var(--vr-text-muted); white-space: normal; word-break: break-word; }
 .vr-upload-status { color: var(--vr-text-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.vr-footer-uploads { max-height: 30vh; overflow-y: auto; }
-.vr-footer-uploads .vr-uploads:not(:empty) { padding-bottom: 0.6rem; }
 .vr-danger { border: 1px solid #c10015; border-radius: 2px; padding: 1rem 1.25rem; }
 .vr-source-name { color: var(--vr-fg); word-break: break-word; }
 .vr-doc-row { padding: 0.6rem 0; border-bottom: 1px solid var(--vr-border); }
@@ -1724,9 +1722,11 @@ def unlock_page():
     with _auth_card(
         "En sista gång",
         f"Kontot {s.username} skapades med en separat lösenfras. Ange den en sista gång; "
-        "därefter låser ditt lösenord upp dokumenten och lösenfrasen behövs inte mer.",
+        "därefter låser ditt lösenord upp dokumenten och lösenfrasen behövs inte mer. "
+        "Observera: lösenfrasen, inte lösenordet. Kontrollera att webbläsaren inte har fyllt i lösenordet.",
     ):
-        phrase = _secret_input("Lösenfras", "current-password").props("autofocus")
+        # Not "current-password": browsers would autofill the login password here.
+        phrase = _secret_input("Lösenfras (inte lösenordet)", "off").props('autofocus name="legacy-passphrase"')
         error = ui.label("").classes("text-red q-mt-sm")
 
         async def do_unlock():
@@ -1743,7 +1743,8 @@ def unlock_page():
                     end_session()
                     ui.navigate.to("/login")
                     return
-                error.set_text("Fel lösenfras.")
+                left = Throttle.MAX_FAILS - len(throttle.fails.get(key_throttle, []))
+                error.set_text(f"Fel lösenfras. {left} försök kvar innan kontot spärras i 15 minuter.")
                 return
             throttle.reset(key_throttle)
             kek, salt = s.migration
@@ -2160,7 +2161,7 @@ async def main_page():
             ui.label("Vad vill du veta om dina dokument?").classes("vr-greeting")
             ui.label(
                 "Dina dokument lagras krypterade med din egen nyckel. "
-                "Ladda upp PDF-, DOCX-, HTML- eller ZIP-filer och ställ frågor om dem."
+                "Ladda upp PDF-, DOCX-, HTML- eller ZIP-filer under Dokument och ställ frågor om dem."
             ).classes("vr-greeting-sub")
             with ui.row().classes("justify-center gap-2 q-mt-md"):
                 for example in (
@@ -2342,8 +2343,6 @@ async def main_page():
     # --- Composer, pinned to the bottom ---
     with ui.footer().classes("vr-footer"):
         with ui.column().classes("w-full max-w-3xl mx-auto q-px-md"):
-            with ui.element("div").classes("w-full vr-footer-uploads"):
-                UploadPanel(s)
             with ui.column().classes("w-full gap-0 vr-composer"):
                 question_input = (
                     ui.textarea(placeholder="Ställ en fråga om dina dokument...")
@@ -2362,10 +2361,6 @@ async def main_page():
                 )
 
                 with ui.row().classes("w-full items-center no-wrap gap-2"):
-                    _file_button(ui.button(icon="attach_file")).props('flat round size=sm color="black"').tooltip(
-                        "Lägg till PDF eller DOCX i ditt bibliotek"
-                    )
-                    _upload_support(s)
 
                     ui.space()
 
