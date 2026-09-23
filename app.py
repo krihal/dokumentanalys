@@ -2458,8 +2458,7 @@ async def documents_page():
                 ).classes("vr-btn")
                 _file_button(ui.button("Ladda upp", icon="upload")).props('outline no-caps color="black"').classes("vr-btn")
         UploadPanel(s)
-        with ui.row().classes("w-full items-center no-wrap gap-2") as list_tools:
-            search = ui.input(placeholder="Sök bland dokumenten").props("dense outlined clearable").classes("col")
+        with ui.row().classes("w-full items-center justify-end no-wrap gap-2") as list_tools:
             prev_btn = ui.button(icon="chevron_left", color=None).props("flat round size=sm").classes("vr-plain")
             page_label = ui.label("").classes("text-caption vr-status").style("white-space: nowrap;")
             next_btn = ui.button(icon="chevron_right", color=None).props("flat round size=sm").classes("vr-plain")
@@ -2498,13 +2497,10 @@ async def documents_page():
         view["rendered_at"] = time.monotonic()
         docs = sorted(idx.docs.values(), key=lambda d: d.created, reverse=True)
         status_label.set_text(f"{len(docs)} dokument")
-        query = (search.value or "").strip().lower()
-        if query:
-            docs = [d for d in docs if query in d.filename.lower() or query in (d.metadata.get("title") or "").lower()]
         pages = max(1, -(-len(docs) // PAGE_SIZE))
         view["page"] = min(view["page"], pages - 1)
         first = view["page"] * PAGE_SIZE
-        list_tools.set_visibility(len(idx.docs) > 10)
+        list_tools.set_visibility(len(docs) > PAGE_SIZE)
         page_label.set_text(f"{first + 1 if docs else 0}–{min(first + PAGE_SIZE, len(docs))} av {len(docs)}")
         prev_btn.set_enabled(view["page"] > 0)
         next_btn.set_enabled(view["page"] < pages - 1)
@@ -2512,8 +2508,6 @@ async def documents_page():
         with docs_box:
             if not idx.docs:
                 ui.label("Inga dokument ännu. Ladda upp PDF-, DOCX-, HTML- eller ZIP-filer.").classes("vr-greeting-sub q-mt-lg")
-            elif not docs:
-                ui.label("Inga dokument matchar sökningen.").classes("vr-greeting-sub q-mt-md")
             if idx.skipped_models:
                 ui.label(
                     f"{sum(d.embed_model in idx.skipped_models for d in idx.docs.values())} dokument är indexerade med en annan "
@@ -2534,13 +2528,8 @@ async def documents_page():
         view["page"] = max(0, view["page"] + step)
         await render_docs()
 
-    async def new_search():
-        view["page"] = 0
-        await render_docs()
-
     prev_btn.on_click(partial(turn_page, -1))
     next_btn.on_click(partial(turn_page, 1))
-    search.on_value_change(new_search)
 
     async def poll():
         idx = s.index

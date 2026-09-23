@@ -131,9 +131,9 @@ Raden ligger kvar tills du stänger den med **✕**.
 
 ### Dokumentlistan
 
-Listan visar dina dokument med filnamn, typ, år och diarienummer. Har du
-fler än 50 dokument delas listan upp i sidor, och du kan söka på filnamn
-eller titel i sökrutan ovanför listan. Papperskorgen till höger tar bort ett
+Listan visar dina dokument med filnamn, typ, år och diarienummer, de
+senast uppladdade först. Har du fler än 50 dokument delas listan upp i sidor
+som du bläddrar mellan med pilarna ovanför listan. Papperskorgen till höger tar bort ett
 dokument.
 
 > **Originalfilerna sparas inte.** Tjänsten sparar bara den text som behövs
