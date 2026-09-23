@@ -430,6 +430,9 @@ def process_answer(job: dict, model: str):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+    # Sources first (empty text): the prompt can take minutes to read before the
+    # first token, and the UI shows what is being read meanwhile.
+    yield sources, num_sources, ""
     for piece in llm_chat_stream(model, messages):
         yield sources, num_sources, piece
 
@@ -530,7 +533,9 @@ async def handle_job(ws, msg: dict):
             async for sources, num_sources, token in iterate_in_thread(lambda: process_answer(msg, model)):
                 if not sources_sent:
                     sources_sent = True
-                    await ws.send(json.dumps({"type": "sources", "id": job_id, "sources": sources}))
+                    await ws.send(json.dumps({"type": "sources", "id": job_id, "sources": sources, "num_sources": num_sources}))
+                if not token:
+                    continue
                 await ws.send(json.dumps({"type": "chunk", "id": job_id, "text": token, "num_sources": num_sources}))
             await ws.send(json.dumps({"type": "done", "id": job_id}))
 

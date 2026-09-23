@@ -4,7 +4,9 @@ Accounts, keys and documents live in VAULT_DIR (default ./vault):
 
     vault.db                    users and document keys (SQLite)
     blobs/<user_id>/<doc>.idx   encrypted search index for one document
-    blobs/<user_id>/<doc>.orig  encrypted original file
+
+Original files are not kept: only what search and answers need (text
+passages, metadata, embeddings), so answers can name the source document.
 
 Cryptography (libsodium via PyNaCl):
 
@@ -102,7 +104,9 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def init() -> None:
+def init() -> int:
+    """Create the vault if needed. Returns the number of stored original files
+    removed (earlier versions kept them)."""
     old = os.umask(0o077)
     try:
         with closing(_connect()) as conn, conn:
@@ -111,6 +115,11 @@ def init() -> None:
         BLOB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     finally:
         os.umask(old)
+    removed = 0
+    for orig in BLOB_DIR.glob("*/*.orig"):
+        orig.unlink(missing_ok=True)
+        removed += 1
+    return removed
 
 
 def _encrypt(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
@@ -334,8 +343,8 @@ def change_passphrase(user_id: int, sk: PrivateKey, new_passphrase: str) -> None
 # ---------------------------------------------------------------------------
 
 
-def add_document(user_id: int, index_payload: bytes, original: bytes) -> str:
-    """Encrypt and store one document. Needs only the user's public key."""
+def add_document(user_id: int, index_payload: bytes) -> str:
+    """Encrypt and store one document's search index. Needs only the user's public key."""
     user = get_user(user_id)
     if not user or not has_keys(user):
         raise VaultError("Kontot saknar nycklar.")
@@ -345,7 +354,6 @@ def add_document(user_id: int, index_payload: bytes, original: bytes) -> str:
     old = os.umask(0o077)
     try:
         _write_private(_blob_path(user_id, doc_id, "idx"), _encrypt(dek, index_payload, _doc_aad(user_id, doc_id, "idx")))
-        _write_private(_blob_path(user_id, doc_id, "orig"), _encrypt(dek, original, _doc_aad(user_id, doc_id, "orig")))
     finally:
         os.umask(old)
     with closing(_connect()) as conn, conn:
@@ -365,10 +373,9 @@ def list_documents(user_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def read_document(user_id: int, doc_id: str, sk: PrivateKey, kind: str = "idx") -> bytes:
-    """Decrypt one blob ("idx" or "orig") of a document owned by user_id."""
-    if kind not in ("idx", "orig"):
-        raise ValueError(kind)
+def read_document(user_id: int, doc_id: str, sk: PrivateKey) -> bytes:
+    """Decrypt the search index of a document owned by user_id."""
+    kind = "idx"
     with closing(_connect()) as conn:
         row = conn.execute(
             "SELECT sealed_key FROM documents WHERE id = ? AND user_id = ?", (doc_id, user_id)

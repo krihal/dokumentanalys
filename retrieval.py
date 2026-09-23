@@ -148,42 +148,57 @@ class Doc:
 class UserIndex:
     docs: dict[str, Doc] = field(default_factory=dict)
     refs: list[tuple[str, int]] = field(default_factory=list)  # row -> (doc_id, chunk_index)
-    matrix: np.ndarray | None = None
-    bm25: BM25Okapi | None = None
     embed_model: str = ""
     skipped_models: set[str] = field(default_factory=set)  # docs embedded with another model
+    version: int = 0  # bumped on every add, so views know to refresh
+    # Search structures are rebuilt lazily, on the first search after a change:
+    # adding documents one by one (a large upload) stays cheap.
+    _vectors: list[np.ndarray] = field(default_factory=list)
+    _tokens: list[list[str]] = field(default_factory=list)
+    _matrix: np.ndarray | None = None
+    _bm25: BM25Okapi | None = None
+    _dirty: bool = False
 
     @classmethod
     def build(cls, records: list[tuple[str, float, dict]], embed_model: str) -> "UserIndex":
         """records: (doc_id, created, decrypted document record from ingest.process_document)."""
         idx = cls(embed_model=embed_model)
-        vectors, tokenized = [], []
         for doc_id, created, rec in records:
-            doc = Doc(
-                doc_id=doc_id,
-                filename=rec["filename"],
-                kind=rec.get("kind", ""),
-                size=rec.get("size", 0),
-                created=created,
-                sha256=rec.get("sha256", ""),
-                metadata=rec.get("metadata", {}),
-                full_text=rec.get("full_text", ""),
-                chunks=rec["chunks"],
-                embed_model=rec.get("embed_model", ""),
-            )
-            idx.docs[doc_id] = doc
-            if embed_model and doc.embed_model != embed_model:
-                idx.skipped_models.add(doc.embed_model)
-                continue
-            emb = np.frombuffer(base64.b64decode(rec["embeddings"]), dtype=np.float32).reshape(-1, rec["dim"])
-            vectors.append(emb)
-            for i, c in enumerate(doc.chunks):
-                idx.refs.append((doc_id, i))
-                tokenized.append(bm25_tokenize(c["text"]))
-        if vectors:
-            idx.matrix = np.vstack(vectors)
-            idx.bm25 = BM25Okapi(tokenized)
+            idx.add(doc_id, created, rec)
         return idx
+
+    def add(self, doc_id: str, created: float, rec: dict) -> None:
+        doc = Doc(
+            doc_id=doc_id,
+            filename=rec["filename"],
+            kind=rec.get("kind", ""),
+            size=rec.get("size", 0),
+            created=created,
+            sha256=rec.get("sha256", ""),
+            metadata=rec.get("metadata", {}),
+            full_text=rec.get("full_text", ""),
+            chunks=rec["chunks"],
+            embed_model=rec.get("embed_model", ""),
+        )
+        self.docs[doc_id] = doc
+        self.version += 1
+        if self.embed_model and doc.embed_model != self.embed_model:
+            self.skipped_models.add(doc.embed_model)
+            return
+        emb = np.frombuffer(base64.b64decode(rec["embeddings"]), dtype=np.float32).reshape(-1, rec["dim"])
+        self._vectors.append(emb)
+        for i, c in enumerate(doc.chunks):
+            self.refs.append((doc_id, i))
+            self._tokens.append(bm25_tokenize(c["text"]))
+        self._dirty = True
+
+    def _search_structures(self) -> tuple[np.ndarray | None, BM25Okapi | None]:
+        if self._dirty:
+            self._matrix = np.vstack(self._vectors) if self._vectors else None
+            self._vectors = [self._matrix] if self._matrix is not None else []
+            self._bm25 = BM25Okapi(self._tokens) if self._tokens else None
+            self._dirty = False
+        return self._matrix, self._bm25
 
     # --- search -------------------------------------------------------------
 
@@ -200,18 +215,20 @@ class UserIndex:
         }
 
     def vector_search(self, qvec: np.ndarray, top_k: int) -> list[dict]:
-        if self.matrix is None or qvec.shape[0] != self.matrix.shape[1]:
+        matrix, _ = self._search_structures()
+        if matrix is None or qvec.shape[0] != matrix.shape[1]:
             return []
-        scores = self.matrix @ qvec
+        scores = matrix @ qvec
         k = min(top_k, len(scores))
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top])]
         return [self._hit(int(r), float(scores[r]), "vector") for r in top]
 
     def bm25_search(self, query: str, top_k: int) -> list[dict]:
-        if self.bm25 is None:
+        _, bm25 = self._search_structures()
+        if bm25 is None:
             return []
-        scores = self.bm25.get_scores(bm25_tokenize(query))
+        scores = bm25.get_scores(bm25_tokenize(query))
         k = min(top_k, len(scores))
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top])]

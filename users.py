@@ -98,7 +98,7 @@ def cmd_import(args):
         try:
             data = path.read_bytes()
             record = process_document(data, path.name, model, ocr=args.ocr)
-            vault.add_document(user["id"], json.dumps(record).encode(), data)
+            vault.add_document(user["id"], json.dumps(record).encode())
             ok += 1
         except DocumentError:
             failed += 1

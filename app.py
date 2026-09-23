@@ -28,7 +28,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from functools import partial
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 from dotenv import load_dotenv
@@ -64,7 +64,7 @@ SESSION_IDLE = int(os.getenv("SESSION_IDLE_MINUTES", "30")) * 60
 SESSION_MAX = int(os.getenv("SESSION_MAX_HOURS", "12")) * 3600
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 INGEST_TIMEOUT = 900  # seconds; OCR of a large scanned PDF is slow
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+ANSWER_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "1800"))  # longest silence from the worker during an answer
 
 # Fallback list, used only until a worker reports what its LLM backend
 # actually serves. Labels here also decorate matching ids from the worker.
@@ -100,61 +100,28 @@ def _doc_stem(filename: str) -> str:
     return re.sub(r"\.(pdf|docx|html?)$", "", filename, flags=re.IGNORECASE)
 
 
-def source_url(src: dict) -> str:
-    """Link to the decrypted original of a cited document (served by /doc/)."""
-    return f"/doc/{quote(str(src.get('doc_id') or ''))}"
-
-
 def _md_escape(text: str) -> str:
     return re.sub(r"([\\`*_\[\]<>])", r"\\\1", text)
 
 
-# Code blocks, inline code and existing Markdown links: text inside them is
-# never linkified in place.
-_PROTECTED_MD = re.compile(r"(```.*?```|`[^`\n]+`|\[[^\]\n]*\]\([^)\n]*\))", re.DOTALL)
+# Code blocks and inline code: left exactly as written.
+_CODE_MD = re.compile(r"(```.*?```|`[^`\n]+`)", re.DOTALL)
 
 
-def linkify_sources(text: str, sources: list[dict]) -> str:
-    """Turn mentions of known document names in the answer into links.
-
-    Plain-text mentions are matched in one regex pass (longest name first), so
-    inserted link text and URLs are never re-matched. Models often wrap file
-    names in backticks; such a code span is replaced by a link when its whole
-    content is a known name, also if the model shortened it with "...".
-    Fenced code and existing links are left untouched.
-    """
-    urls = {_doc_stem(s["filename"]).lower(): source_url(s) for s in sources if s.get("filename") and s.get("doc_id")}
-    if not urls:
+def protect_source_names(text: str, sources: list[dict]) -> str:
+    """Escape Markdown characters in cited file names, so "dok_0413.pdf, dok_0658.pdf"
+    is not read as italics. A code span that is exactly a file name becomes plain text."""
+    names = {s.get("filename", "") for s in sources} | {_doc_stem(s.get("filename", "")) for s in sources}
+    names = sorted((n for n in names if n and re.search(r"[\\`*_\[\]<>]", n)), key=len, reverse=True)
+    if not names:
         return text
-    stems = sorted(urls, key=len, reverse=True)
-    pattern = re.compile(
-        r"(?<![\[\w=/])(" + "|".join(re.escape(st) for st in stems) + r")(\.pdf|\.docx)?(?![\w\]])",
-        re.IGNORECASE,
-    )
-
-    def link(label: str, url: str) -> str:
-        return f"[{_md_escape(label)}]({url})"
-
-    def resolve(name: str) -> str | None:
-        """URL for a complete file name, or for one shortened as 'start...end'."""
-        key = _doc_stem(name.strip()).lower()
-        if key in urls:
-            return urls[key]
-        parts = re.split(r"\.\.\.|\u2026", key)
-        if len(parts) != 2 or len(parts[0]) < 8:
-            return None
-        head, tail = parts
-        hits = [u for st, u in urls.items() if st.startswith(head) and st.endswith(tail) and len(st) > len(head) + len(tail)]
-        return hits[0] if len(hits) == 1 else None
-
+    pattern = re.compile("|".join(re.escape(n) for n in names))
     out = []
-    for i, piece in enumerate(_PROTECTED_MD.split(text)):
+    for i, piece in enumerate(_CODE_MD.split(text)):
         if i % 2 == 0:
-            out.append(pattern.sub(lambda m: link(m.group(0), urls[m.group(1).lower()]), piece))
-        elif piece.startswith("`") and not piece.startswith("```"):
-            inner = piece[1:-1]
-            url = resolve(inner)
-            out.append(link(inner.strip(), url) if url else piece)
+            out.append(pattern.sub(lambda m: _md_escape(m.group(0)), piece))
+        elif piece.startswith("`") and not piece.startswith("```") and pattern.fullmatch(piece[1:-1].strip()):
+            out.append(_md_escape(piece[1:-1].strip()))
         else:
             out.append(piece)
     return "".join(out)
@@ -473,12 +440,17 @@ async def stop_user_activity(user_id: int) -> None:
         await asyncio.sleep(0.1)
 
 
-async def _save_document(s: Session, record: dict, data: bytes) -> None:
-    """Encrypt and store. Shielded by callers: once started it always completes,
-    and stop_user_activity waits for it."""
+async def _save_document(s: Session, record: dict) -> None:
+    """Encrypt and store, then add to the user's loaded indexes (no re-decryption).
+    Shielded by callers: once started it always completes, and
+    stop_user_activity waits for it."""
     s.saving += 1
     try:
-        await run.io_bound(vault.add_document, s.user_id, json.dumps(record).encode(), data)
+        doc_id = await run.io_bound(vault.add_document, s.user_id, json.dumps(record).encode())
+        created = time.time()
+        for other in SESSIONS.values():
+            if other.user_id == s.user_id and other.index is not None:
+                other.index.add(doc_id, created, record)
     finally:
         s.saving -= 1
 
@@ -599,7 +571,7 @@ def _load_index(user_id: int, key: PrivateKey, embed_model: str) -> UserIndex:
     records = []
     for d in vault.list_documents(user_id):
         try:
-            rec = json.loads(vault.read_document(user_id, d["id"], key, "idx"))
+            rec = json.loads(vault.read_document(user_id, d["id"], key))
         except vault.VaultError:
             log.warning("A document could not be decrypted and was skipped.")
             continue
@@ -709,6 +681,7 @@ def _new_job_buffer(job_id: str, owner: int, question: str) -> dict:
         "error": None,
         "num_sources": 0,
         "sources": [],
+        "note": "",  # shown instead of the source list when no document is cited
         "events": set(),
     }
     return active_jobs[job_id]
@@ -733,6 +706,7 @@ async def run_question(s: Session, job_id: str, question: str, model: str) -> No
     try:
         idx = await ensure_index(s)
         if not idx.docs:
+            buf["note"] = "Biblioteket är tomt."
             _finish(buf, "Du har inga dokument ännu. Ladda upp PDF- eller DOCX-filer under **Dokument**.")
             return
         plan = plan_question(question)
@@ -747,6 +721,10 @@ async def run_question(s: Session, job_id: str, question: str, model: str) -> No
             qvec = np.asarray(msg["vector"], dtype=np.float32)
             candidates = await run.io_bound(idx.candidates, question, qvec, plan.analytical)
         stats, stats_docs = idx.stats_context(question) if plan.aggregate else ("", 0)
+        buf["note"] = (
+            f"Svaret bygger på uppgifter om alla {len(idx.docs)} dokument i biblioteket (år, typ, språk), inte på enskilda dokument."
+            if stats else "Inga dokument i biblioteket användes för svaret."
+        )
         text_search, ts_sources = idx.text_search(plan.search_terms) if plan.search_terms else ("", [])
 
         job = {
@@ -762,9 +740,11 @@ async def run_question(s: Session, job_id: str, question: str, model: str) -> No
             "extra_sources": ts_sources,
             "num_docs": stats_docs,
         }
-        async for msg in send_job(job):
+        # Reading a full context window can take minutes before the first token.
+        async for msg in send_job(job, timeout=ANSWER_TIMEOUT):
             if msg["type"] == "sources":
                 buf["sources"] = msg.get("sources", [])
+                buf["num_sources"] = msg.get("num_sources", len(buf["sources"]))
             elif msg["type"] == "chunk":
                 buf["text"] += msg.get("text", "")
                 buf["num_sources"] = msg.get("num_sources", 0)
@@ -811,12 +791,12 @@ async def follow_job(job_id: str):
                 if buf["error"]:
                     yield {"type": "error", "message": buf["error"]}
                 else:
-                    yield {"type": "done"}
+                    yield {"type": "done", "note": buf.get("note", "")}
                 break
 
             event.clear()
             try:
-                await asyncio.wait_for(event.wait(), timeout=330)
+                await asyncio.wait_for(event.wait(), timeout=ANSWER_TIMEOUT + 30)
             except asyncio.TimeoutError:
                 yield {"type": "error", "message": "Timeout — inget svar från workern."}
                 break
@@ -888,7 +868,7 @@ def _clean_filename(raw: str) -> str:
 # reports them with emitEvent); the rest on the server.
 ACTIVE_STATES = ("queued", "uploading", "waiting", "processing", "saving")
 FINAL_STATES = ("done", "error", "cancelled")
-MAX_ACTIVE_UPLOADS = 50  # per session, files queued or in progress
+MAX_ACTIVE_UPLOADS = 5000  # per session, files queued or in progress
 MAX_BUFFERED_BYTES = 4 * MAX_UPLOAD_BYTES + int(os.getenv("MAX_ZIP_MB", "500")) * 1024 * 1024  # per session, received, not yet processed
 
 
@@ -956,13 +936,13 @@ async def _ingest_file(s: Session, entry: dict, name: str, data: bytes, known: s
     if record.get("sha256") != sha:
         raise UploadError("Bearbetningen misslyckades.")
     known.add(sha)
-    await asyncio.shield(_save_document(s, record, data))
+    await asyncio.shield(_save_document(s, record))
 
 
 # ZIP archives: unpacked in memory, one member at a time, only when it is its turn.
 MAX_ZIP_BYTES = int(os.getenv("MAX_ZIP_MB", "500")) * 1024 * 1024
-MAX_ZIP_FILES = 2000
-MAX_ZIP_ENTRIES = 5000  # files plus directories and junk, checked before parsing
+MAX_ZIP_FILES = 5000
+MAX_ZIP_ENTRIES = 10000  # files plus directories and junk, checked before parsing
 _ZIP_JUNK = re.compile(r"(^|/)(__MACOSX/|\.)|(^|/)(Thumbs\.db|desktop\.ini)$", re.I)
 
 
@@ -1046,17 +1026,13 @@ async def ingest_upload(s: Session, entry: dict, data: bytes) -> None:
             _set_upload(entry, state="processing", stage="", done=0, total=0)
             known = {d.sha256 for d in (await ensure_index(s)).docs.values()}
             if entry["kind"] == "zip":
-                try:
-                    await _ingest_zip(s, entry, data, known)
-                finally:
-                    invalidate_indexes(s.user_id)
+                await _ingest_zip(s, entry, data, known)
                 if entry["ok"] == 0 and entry["failures"] and not entry["dupes"]:
                     _set_upload(entry, state="error", message="Inga dokument kunde läsas in.")
                 else:
                     _set_upload(entry, state="done", message="")
                 return
             await _ingest_file(s, entry, entry["name"], data, known)
-            invalidate_indexes(s.user_id)
             _set_upload(entry, state="done", message="")
     except asyncio.CancelledError:
         if entry.get("job_id"):
@@ -1128,11 +1104,13 @@ async def upload_endpoint(request: Request):
         return _reject(entry, 413, _UPLOAD_ERRORS[413])
     # Memory: one body read at a time per session, and received files waiting
     # for processing are capped. Counted in real bytes: the header may be absent.
-    if s.receiving:
-        return _reject(entry, 429, "En annan uppladdning pågår. Försök igen när den är klar.")
+    # Busy: the browser waits and sends the same file again (backpressure while
+    # the worker catches up), so a large selection is never rejected for speed.
     buffered = sum(u["size"] for u in s.uploads.values() if u["state"] in ("waiting", "processing"))
-    if buffered + size > MAX_BUFFERED_BYTES:
-        return _reject(entry, 429, _UPLOAD_ERRORS[429])
+    if s.receiving or buffered + size > MAX_BUFFERED_BYTES:
+        if entry["state"] == "uploading":
+            _set_upload(entry, state="queued", loaded=0)
+        return JSONResponse({"error": "busy", "retry": True}, status_code=429)
 
     s.receiving = True
     buf = bytearray()
@@ -1141,8 +1119,8 @@ async def upload_endpoint(request: Request):
             buf += chunk
             if len(buf) > limit:
                 return _reject(entry, 413, _UPLOAD_ERRORS[413])
-            if buffered + len(buf) > MAX_BUFFERED_BYTES:
-                return _reject(entry, 429, _UPLOAD_ERRORS[429])
+            if buffered + len(buf) > MAX_BUFFERED_BYTES:  # the declared size was absent or wrong
+                return _reject(entry, 413, _UPLOAD_ERRORS[413])
     except ClientDisconnect:  # the browser aborted (cancel, navigation, network)
         if entry["state"] != "cancelled":
             _set_upload(entry, state="error", message="Överföringen avbröts.")
@@ -1164,47 +1142,6 @@ async def upload_endpoint(request: Request):
     _set_upload(entry, state="waiting", size=len(data), loaded=len(data), kind="zip" if kind == "zip" else "file")
     entry["task"] = asyncio.create_task(ingest_upload(s, entry, data))
     return JSONResponse({"ok": True})
-
-
-@app.get("/doc/{doc_id}")
-async def document_endpoint(doc_id: str, request: Request):
-    """The decrypted original of one of the user's documents."""
-    s = get_session(request.session.get("id"))
-    if not s or s.stage != "ready" or s.key is None:
-        return RedirectResponse("/login")
-    try:
-        uuid.UUID(doc_id)
-        idx = await ensure_index(s)
-        doc = idx.docs[doc_id]
-        data = await run.io_bound(vault.read_document, s.user_id, doc_id, s.key, "orig")
-    except (ValueError, KeyError, vault.VaultError):
-        return Response("Dokumentet finns inte.", status_code=404, media_type="text/plain; charset=utf-8")
-    s.touch()
-    disposition = "inline" if doc.kind in ("pdf", "html") else "attachment"
-    headers = {
-        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(doc.filename)}",
-        "Cache-Control": "no-store",
-    }
-    if doc.kind == "html":
-        # Untrusted markup on our origin: a sandbox without allow-scripts or
-        # allow-same-origin gives it an opaque origin, no scripts, no requests.
-        headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
-        media_type = f"text/html; charset={_html_charset(data)}"
-    else:
-        media_type = "application/pdf" if doc.kind == "pdf" else DOCX_MIME
-    return Response(data, media_type=media_type, headers=headers)
-
-
-def _html_charset(data: bytes) -> str:
-    """Declared charset (meta tag), else UTF-8 if it decodes, else Windows-1252 (as ingest.html_charset)."""
-    m = re.search(rb"""charset\s*=\s*["']?([A-Za-z0-9_.:-]+)""", data[:4096], re.I)
-    if m:
-        return m.group(1).decode("ascii")
-    try:
-        data.decode("utf-8")
-        return "utf-8"
-    except UnicodeDecodeError:
-        return "windows-1252"
 
 
 # --- HTTP hardening -----------------------------------------------------------
@@ -1571,6 +1508,7 @@ body.body--dark .vr-logo-light { display: block; }
 .vr-footer-uploads { max-height: 30vh; overflow-y: auto; }
 .vr-footer-uploads .vr-uploads:not(:empty) { padding-bottom: 0.6rem; }
 .vr-danger { border: 1px solid #c10015; border-radius: 2px; padding: 1rem 1.25rem; }
+.vr-source-name { color: var(--vr-fg); word-break: break-word; }
 .vr-doc-row { padding: 0.6rem 0; border-bottom: 1px solid var(--vr-border); }
 """
 
@@ -1812,7 +1750,8 @@ _UPLOAD_JS = """
         if (active || !queue.length) return;
         const item = queue.shift();
         const xhr = new XMLHttpRequest();
-        active = {id: item.id, xhr: xhr};
+        active = item;
+        item.xhr = xhr;
         let last = 0;
         xhr.open('POST', '/api/upload');
         xhr.setRequestHeader('X-VR-Upload', '1');
@@ -1828,6 +1767,13 @@ _UPLOAD_JS = """
         };
         xhr.onloadend = function () {
             active = null;
+            let retry = false;
+            if (xhr.status === 429) { try { retry = JSON.parse(xhr.responseText).retry === true; } catch (err) {} }
+            if (retry && !item.cancelled) {  // server busy: same file again shortly, order kept
+                queue.unshift(item);
+                setTimeout(pump, 2000);
+                return;
+            }
             emitEvent('vr_upload_done', {id: item.id, status: xhr.status});
             pump();
         };
@@ -1848,7 +1794,11 @@ _UPLOAD_JS = """
     window.vrCancelUpload = function (id) {
         const i = queue.findIndex(function (q) { return q.id === id; });
         if (i >= 0) queue.splice(i, 1);
-        if (active && active.id === id) active.xhr.abort();
+        if (active && active.id === id) { active.cancelled = true; active.xhr.abort(); }
+    };
+    window.vrCancelAllUploads = function () {
+        queue.length = 0;
+        if (active) { active.cancelled = true; active.xhr.abort(); }
     };
 
     // Leaving the page aborts transfers still in the browser (processing on
@@ -1963,17 +1913,40 @@ def _upload_status(u: dict) -> tuple[str, str, float | None]:
     return u["message"] or "Misslyckades", failures, 0.0
 
 
-class UploadPanel:
-    """One row per upload with name, status, progress bar and a cancel/close
-    button. Updates in place from the session's upload state."""
+async def cancel_all_uploads(s: Session) -> None:
+    ui.run_javascript("window.vrCancelAllUploads && window.vrCancelAllUploads()")
+    for uid in [k for k, u in s.uploads.items() if u["state"] in ACTIVE_STATES]:
+        await cancel_upload(s, uid)
 
-    DONE_LINGER = 5  # seconds a finished row stays visible
+
+class UploadPanel:
+    """Upload progress. Up to BATCH_ROWS uploads: one row each. More: a summary
+    row for the whole batch, plus rows only for files in progress, ZIP archives
+    and errors, so a selection of thousands of files stays readable and cheap."""
+
+    DONE_LINGER = 5  # seconds a finished row stays visible (small batches)
     CANCELLED_LINGER = 3
+    BATCH_ROWS = 8
+    MAX_ERROR_ROWS = 20
+    BUSY_STATES = ("uploading", "processing", "saving")
 
     def __init__(self, s: Session):
         self.s = s
         self.rows: dict[str, dict] = {}
         self.box = ui.column().classes("w-full gap-3 vr-uploads")
+        with self.box:
+            with ui.column().classes("w-full gap-1 vr-upload-row vr-upload-summary") as self.summary:
+                with ui.row().classes("w-full items-center no-wrap gap-2"):
+                    ui.icon("upload_file").classes("opacity-60")
+                    with ui.column().classes("col gap-0").style("min-width: 0;"):
+                        self.sum_title = ui.label("").classes("vr-upload-name")
+                        self.sum_detail = ui.label("").classes("text-caption vr-upload-detail")
+                    self.sum_button = ui.button("Avbryt alla", on_click=self._summary_action, color=None).props(
+                        "flat no-caps size=sm"
+                    ).classes("vr-btn vr-plain")
+                self.sum_bar = ui.linear_progress(value=0, show_value=False, size="4px", color=None).classes("vr-bar")
+            self.summary.set_visibility(False)
+        self.sum_key = None
         self.refresh()
         ui.timer(0.25, self.refresh)
 
@@ -2003,17 +1976,70 @@ class UploadPanel:
         else:
             await cancel_upload(self.s, uid)
 
+    async def _summary_action(self):
+        if any(u["state"] in ACTIVE_STATES for u in self.s.uploads.values()):
+            await cancel_all_uploads(self.s)
+        else:  # batch finished: clear it
+            self.s.uploads.clear()
+            self.refresh()
+
+    def _visible(self, batch: bool) -> list[str]:
+        uploads = self.s.uploads
+        if not batch:
+            return list(uploads)
+        errors = [k for k, u in uploads.items() if u["state"] == "error" and u["kind"] != "zip"]
+        return [
+            k for k, u in uploads.items()
+            if u["state"] in self.BUSY_STATES or u["kind"] == "zip"
+        ] + errors[-self.MAX_ERROR_ROWS :]
+
+    def _render_summary(self, batch: bool):
+        self.summary.set_visibility(batch)
+        if not batch:
+            return
+        counts: dict[str, int] = {}
+        for u in self.s.uploads.values():
+            counts[u["state"]] = counts.get(u["state"], 0) + 1
+        total = len(self.s.uploads)
+        done, failed, cancelled = counts.get("done", 0), counts.get("error", 0), counts.get("cancelled", 0)
+        finished = done + failed + cancelled
+        active = total - finished
+        title = f"{finished} av {total} filer klara" if active else f"Klart: {total} filer"
+        bits = [f"{done} inlästa", f"{failed} misslyckades" if failed else "", f"{cancelled} avbrutna" if cancelled else ""]
+        waiting = counts.get("queued", 0) + counts.get("waiting", 0)
+        if waiting:
+            bits.append(f"{waiting} i kö")
+        hidden = failed - min(failed, self.MAX_ERROR_ROWS)
+        if hidden:
+            bits.append(f"de {self.MAX_ERROR_ROWS} senaste felen visas")
+        key = (title, tuple(bits), active > 0)
+        if key == self.sum_key:
+            return
+        self.sum_key = key
+        self.sum_title.set_text(title)
+        self.sum_detail.set_text(" · ".join(b for b in bits if b))
+        self.sum_bar.set_value(finished / total if total else 0)
+        self.sum_bar.set_visibility(active > 0)
+        self.sum_button.set_text("Avbryt alla" if active else "Stäng")
+
     def refresh(self):
         now = time.monotonic()
-        for uid, u in list(self.s.uploads.items()):
-            # Rows with something to read (ZIP results, failures) stay until closed.
-            sticky = u["kind"] == "zip" and u["state"] in FINAL_STATES
-            linger = None if sticky else {"done": self.DONE_LINGER, "cancelled": self.CANCELLED_LINGER}.get(u["state"])
-            if linger and now - u["updated"] > linger:
-                self.s.uploads.pop(uid, None)
-        for uid in [k for k in self.rows if k not in self.s.uploads]:
+        uploads = self.s.uploads
+        batch = len(uploads) > self.BATCH_ROWS  # a finished batch stays summarized until "Stäng"
+        if not batch:
+            for uid, u in list(uploads.items()):
+                # Rows with something to read (ZIP results, failures) stay until closed.
+                sticky = u["kind"] == "zip" and u["state"] in FINAL_STATES
+                linger = None if sticky else {"done": self.DONE_LINGER, "cancelled": self.CANCELLED_LINGER}.get(u["state"])
+                if linger and now - u["updated"] > linger:
+                    uploads.pop(uid, None)
+        self._render_summary(batch)
+        visible = self._visible(batch)
+        shown = set(visible)
+        for uid in [k for k in self.rows if k not in shown]:
             self.box.remove(self.rows.pop(uid)["root"])
-        for uid, u in self.s.uploads.items():
+        for uid in visible:
+            u = uploads[uid]
             row = self.rows.get(uid) or self.rows.setdefault(uid, self._add_row(uid, u))
             text, detail, value = _upload_status(u)
             key = (u["state"], text, detail, value)
@@ -2149,20 +2175,24 @@ async def main_page():
             self.detail.set_text(detail)
             self.progress.set_visibility(True)
 
-        def render_sources(self, sources: list[dict]):
-            """List the cited documents with links to the decrypted originals."""
+        def render_sources(self, sources: list[dict], note: str = ""):
+            """Always say what the answer rests on: the documents used, as references
+            (originals are not stored), or a note when no document is cited."""
             self.sources_box.clear()
-            if not sources:
-                self.sources_box.set_visibility(False)
-                return
             with self.sources_box:
                 ui.label("Källor").classes("text-subtitle2").style("font-weight: 600;")
-                for src in sources:
-                    bits = _source_bits(src)
-                    with ui.row().classes("items-baseline gap-2 no-wrap"):
-                        ui.link(_doc_stem(src["filename"]), source_url(src), new_tab=True).classes("vr-link")
-                        if bits:
-                            ui.label("(" + ", ".join(str(b) for b in bits) + ")").classes("text-caption opacity-70").style("white-space: nowrap;")
+                if not sources:
+                    ui.label(note or "Inga dokument i biblioteket användes för svaret.").classes("text-caption vr-status")
+                for n, src in enumerate(sources, 1):
+                    bits = [str(b) for b in _source_bits(src)]
+                    title = (src.get("title") or "").strip()
+                    with ui.row().classes("items-baseline gap-2 no-wrap vr-source"):
+                        ui.label(f"{n}.").classes("text-caption vr-status")
+                        with ui.column().classes("gap-0"):
+                            ui.label(src.get("filename") or "okänt dokument").classes("vr-source-name")
+                            detail = " · ".join(([title] if title and title.lower() != _doc_stem(src.get("filename") or "").lower() else []) + bits)
+                            if detail:
+                                ui.label(detail).classes("text-caption vr-status")
             self.sources_box.set_visibility(True)
 
         def render_stream(self, text: str):
@@ -2170,17 +2200,17 @@ async def main_page():
             self.stream.set_visibility(True)
             self.answer.set_visibility(True)
 
-        def render_final(self, text: str, sources: list[dict] | None = None):
+        def render_final(self, text: str, sources: list[dict] | None = None, note: str = ""):
             """Parse text for chart blocks and render mixed markdown + Plotly."""
             sources = sources or []
             self.progress.set_visibility(False)
             self.container.clear()
             segments = [
-                ("md", linkify_sources(normalize_bullets(content), sources)) if kind == "md" else (kind, content)
+                ("md", protect_source_names(normalize_bullets(content), sources)) if kind == "md" else (kind, content)
                 for kind, content in parse_chart_segments(text)
             ]
             has_charts = any(s[0] == "chart" for s in segments)
-            self.render_sources(sources)
+            self.render_sources(sources, note)
             self.answer.set_visibility(True)
 
             if not has_charts:
@@ -2199,7 +2229,8 @@ async def main_page():
                         try:
                             spec = json.loads(content)
                             fig = build_plotly_figure(spec, dark=is_dark)
-                            ui.plotly(fig).classes("w-full")
+                            # No Plotly logo: it links out to plotly.com.
+                            ui.plotly({**fig.to_plotly_json(), "config": {"displaylogo": False}}).classes("w-full")
                         except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
                             ui.markdown(f"```\n{content}\n```").classes("w-full")
             self.container.set_visibility(True)
@@ -2237,6 +2268,12 @@ async def main_page():
         async for msg in follow_job(job_id):
             if msg["type"] == "sources":
                 sources = msg["sources"]
+                if not full_text:
+                    n = len(sources)
+                    turn.set_progress(
+                        "Modellen läser",
+                        f"Utdrag ur {n} dokument. Stora underlag kan ta några minuter." if n else "Förbereder svaret...",
+                    )
             elif msg["type"] == "chunk":
                 num_sources = msg.get("num_sources", 0)
                 turn.set_progress("Skriver svar", f"{num_sources} relevanta dokument hittade")
@@ -2246,8 +2283,8 @@ async def main_page():
                 turn.progress.set_visibility(False)
                 turn.render_stream(f"{full_text}\n\n**Fel:** {msg['message']}")
             elif msg["type"] == "done":
-                turn.render_final(full_text, sources)
-                s.turns.append({"question": question, "text": full_text, "sources": sources})
+                turn.render_final(full_text, sources, msg.get("note", ""))
+                s.turns.append({"question": question, "text": full_text, "sources": sources, "note": msg.get("note", "")})
         if s.active_job == job_id:
             s.active_job = None
 
@@ -2335,16 +2372,6 @@ async def main_page():
 
             ui.label("Svaren bygger på dina dokument och kan innehålla fel.").classes("vr-disclaimer")
 
-    # Source links open the decrypted document in a new tab.
-    ui.add_body_html(
-        """<script>
-        document.addEventListener('click', function(e) {
-            var a = e.target.closest && e.target.closest('.vr-result a[href^="/doc/"]');
-            if (a) { a.target = '_blank'; a.rel = 'noopener noreferrer'; }
-        });
-        </script>"""
-    )
-
     # Follow the answer as it is written. Scrolling up to read stops following;
     # scrolling back to the bottom, or sending a new question, resumes it.
     ui.add_body_html(
@@ -2370,7 +2397,7 @@ async def main_page():
 
     # --- Restore this session's conversation, and resume a running answer ---
     for t in s.turns:
-        Turn(t["question"]).render_final(t["text"], t["sources"])
+        Turn(t["question"]).render_final(t["text"], t["sources"], t.get("note", ""))
     job = active_jobs.get(s.active_job or "")
     if job and job["owner"] == s.user_id:
         turn = Turn(job["question"])
@@ -2411,6 +2438,11 @@ async def documents_page():
                 ).classes("vr-btn")
                 _file_button(ui.button("Ladda upp", icon="upload")).props('outline no-caps color="black"').classes("vr-btn")
         UploadPanel(s)
+        with ui.row().classes("w-full items-center no-wrap gap-2") as list_tools:
+            search = ui.input(placeholder="Sök bland dokumenten").props("dense outlined clearable").classes("col")
+            prev_btn = ui.button(icon="chevron_left", color=None).props("flat round size=sm").classes("vr-plain")
+            page_label = ui.label("").classes("text-caption vr-status").style("white-space: nowrap;")
+            next_btn = ui.button(icon="chevron_right", color=None).props("flat round size=sm").classes("vr-plain")
         docs_box = ui.column().classes("w-full gap-0")
 
     confirm = ui.dialog()
@@ -2431,7 +2463,8 @@ async def documents_page():
             invalidate_indexes(s.user_id)
             await render_docs()
 
-    shown_version: list = [None]
+    PAGE_SIZE = 50
+    view = {"page": 0, "shown": None, "rendered_at": 0.0}
 
     async def render_docs():
         try:
@@ -2441,31 +2474,64 @@ async def documents_page():
             with docs_box:
                 ui.label(str(ex)).classes("text-red")
             return
-        shown_version[0] = id(idx)
+        view["shown"] = (id(idx), idx.version)
+        view["rendered_at"] = time.monotonic()
         docs = sorted(idx.docs.values(), key=lambda d: d.created, reverse=True)
         status_label.set_text(f"{len(docs)} dokument")
+        query = (search.value or "").strip().lower()
+        if query:
+            docs = [d for d in docs if query in d.filename.lower() or query in (d.metadata.get("title") or "").lower()]
+        pages = max(1, -(-len(docs) // PAGE_SIZE))
+        view["page"] = min(view["page"], pages - 1)
+        first = view["page"] * PAGE_SIZE
+        list_tools.set_visibility(len(idx.docs) > 10)
+        page_label.set_text(f"{first + 1 if docs else 0}–{min(first + PAGE_SIZE, len(docs))} av {len(docs)}")
+        prev_btn.set_enabled(view["page"] > 0)
+        next_btn.set_enabled(view["page"] < pages - 1)
         docs_box.clear()
         with docs_box:
-            if not docs:
-                ui.label("Inga dokument ännu. Ladda upp PDF- eller DOCX-filer.").classes("vr-greeting-sub q-mt-lg")
+            if not idx.docs:
+                ui.label("Inga dokument ännu. Ladda upp PDF-, DOCX-, HTML- eller ZIP-filer.").classes("vr-greeting-sub q-mt-lg")
+            elif not docs:
+                ui.label("Inga dokument matchar sökningen.").classes("vr-greeting-sub q-mt-md")
             if idx.skipped_models:
                 ui.label(
-                    f"{sum(d.embed_model in idx.skipped_models for d in docs)} dokument är indexerade med en annan "
+                    f"{sum(d.embed_model in idx.skipped_models for d in idx.docs.values())} dokument är indexerade med en annan "
                     "inbäddningsmodell än workerns och kommer inte med i vektorsökningen. Ladda upp dem igen."
                 ).classes("text-caption text-orange")
-            for d in docs:
+            for d in docs[first : first + PAGE_SIZE]:
                 with ui.row().classes("w-full items-center no-wrap gap-3 vr-doc-row"):
                     ui.icon({"pdf": "picture_as_pdf", "html": "mail"}.get(d.kind, "description")).classes("opacity-60")
                     with ui.column().classes("gap-0 col"):
-                        ui.link(d.filename, f"/doc/{d.doc_id}", new_tab=True).classes("vr-link").style("word-break: break-word;")
+                        ui.label(d.filename).classes("vr-source-name").style("word-break: break-word;")
                         bits = _source_bits(d.source_entry()) + [f"{len(d.chunks)} avsnitt", _format_size(d.size)]
                         ui.label(" · ".join(str(b) for b in bits)).classes("text-caption opacity-70")
                     ui.button(icon="delete_outline", on_click=partial(delete_doc, d.doc_id, d.filename)).props(
                         'flat round size=sm color="black"'
                     ).tooltip("Ta bort")
 
+    async def turn_page(step: int):
+        view["page"] = max(0, view["page"] + step)
+        await render_docs()
+
+    async def new_search():
+        view["page"] = 0
+        await render_docs()
+
+    prev_btn.on_click(partial(turn_page, -1))
+    next_btn.on_click(partial(turn_page, 1))
+    search.on_value_change(new_search)
+
     async def poll():
-        if s.index is None or id(s.index) != shown_version[0]:
+        idx = s.index
+        if idx is None:
+            await render_docs()
+            return
+        if (id(idx), idx.version) == view["shown"]:
+            return
+        # While a large upload runs, redraw at most every few seconds.
+        uploading = any(u["state"] in ACTIVE_STATES for u in s.uploads.values())
+        if not uploading or time.monotonic() - view["rendered_at"] > 3:
             await render_docs()
 
     _upload_support(s)
@@ -2613,7 +2679,9 @@ try:
 except (ValueError, OSError):
     pass
 
-vault.init()
+_removed = vault.init()
+if _removed:
+    log.info("Removed %d stored original files (originals are no longer kept).", _removed)
 
 ui.run(
     title="Analys",

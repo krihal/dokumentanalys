@@ -34,9 +34,12 @@ krypterad (XChaCha20-Poly1305) med en nyckel härledd ur lösenfrasen
 glöms den är dokumenten förlorade. Den kan bytas under Dokument → Konto.
 
 **Dokument.** Varje dokument får en slumpad 256-bitars nyckel som förseglas med
-användarens publika nyckel. Både sökindexet (text, avsnitt, metadata,
-inbäddningar) och originalfilen krypteras med den, bundna till användare och
-dokument så att filer inte kan flyttas mellan dem. Filnamn och metadata finns
+användarens publika nyckel. Sökindexet (text, avsnitt, metadata,
+inbäddningar) krypteras med den, bundet till användare och dokument så att
+filer inte kan flyttas mellan dem. **Originalfilerna sparas inte**: de
+bearbetas i minnet och kastas. Svar hänvisar till källdokumenten med
+filnamn, titel, typ, år och diarienummer, så att användaren vet vilket
+dokument hen ska titta i; källistan visas alltid. Filnamn och metadata finns
 bara inuti de krypterade blobbarna. Att ta bort ett dokument raderar dess
 nyckel (SQLite `secure_delete`), vilket gör resterna oläsbara.
 
@@ -44,20 +47,25 @@ nyckel (SQLite `secure_delete`), vilket gör resterna oläsbara.
 lösenfrasen. Nyckeln och det dekrypterade indexet finns då bara i appens
 minne, kopplade till webbläsarsessionen, och släpps vid utloggning, efter
 `SESSION_IDLE_MINUTES` utan aktivitet, efter `SESSION_MAX_HOURS` och vid
-omstart. Källhänvisningar i svaren länkar till `/doc/<id>`, som dekrypterar
-originalet för ägaren.
+omstart.
 
 **Filtyp** avgörs av innehållet, inte filnamnet: e-post och webbsidor som
 exporterats med namnet `.pdf` läses som HTML. Ur HTML tas bara den synliga
-texten; inget körs eller hämtas. Originalet visas med `Content-Security-Policy:
-sandbox` (inga skript, eget ursprung, inga externa anrop).
+texten; inget körs eller hämtas.
 
 **ZIP-arkiv** (högst `MAX_ZIP_MB`, standard 500 MB) packas upp i minnet, en fil
 i taget och först när det är dess tur; inget skrivs till disk. Varje fil får
 högst `MAX_UPLOAD_MB`, oavsett vad arkivet påstår (skydd mot ZIP-bomber), och
-arkivet högst 2000 filer. Filtypen avgörs av innehållet; annat (bilder,
+arkivet högst 5000 filer. Filtypen avgörs av innehållet; annat (bilder,
 kalkylark, nästlade arkiv, `__MACOSX`) hoppas över. Lösenordsskyddade filer
 avvisas.
+
+**Många dokument.** Biblioteket har ingen övre gräns. Upp till 5000 filer kan
+väljas på en gång (eller en ZIP med upp till 5000); de skickas en i taget och
+webbläsaren väntar när servern har fullt, så inget avvisas för att det går
+fort. Nya dokument läggs direkt in i det laddade sökindexet utan att
+biblioteket dekrypteras om. Provat med 1000 PDF:er: omkring 40 sekunder,
+både som separata filer och som ZIP.
 
 **Radera data.** Under Dokument kan användaren radera alla dokument, eller
 kontot med nycklar och alla dokument. Båda kräver lösenordet och att man
