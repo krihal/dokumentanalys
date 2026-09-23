@@ -620,7 +620,7 @@ pending_jobs: dict[str, asyncio.Queue] = {}  # job_id -> queue of messages
 active_jobs: dict[str, dict] = {}
 JOB_BUFFER_TTL = 600  # seconds a finished job stays resumable after the last update
 
-_TERMINAL = ("done", "error", "ingested", "embedding")
+_TERMINAL = ("done", "error", "ingested", "embedding", "rewritten")
 
 
 @app.websocket("/ws/worker")
@@ -701,6 +701,7 @@ def _new_job_buffer(job_id: str, owner: int, question: str) -> dict:
         "num_sources": 0,
         "sources": [],
         "note": "",  # shown instead of the source list when no document is cited
+        "status": None,  # (step, detail) progress before the answer starts
         "events": set(),
     }
     return active_jobs[job_id]
@@ -718,6 +719,30 @@ def _finish(buf: dict, text: str = "", error: str | None = None) -> None:
     _notify(buf)
 
 
+HISTORY_TURNS = 3  # earlier questions and answers sent along with a new question
+
+
+def _history(s: Session) -> list[dict]:
+    return [{"question": t["question"], "answer": t["text"]} for t in s.turns[-HISTORY_TURNS:]]
+
+
+def _set_status(buf: dict, step: str, detail: str = "") -> None:
+    buf["status"] = (step, detail)
+    _notify(buf)
+
+
+async def standalone_query(question: str, history: list[dict], model: str) -> str:
+    """A follow-up rewritten by the model into a question that stands on its own,
+    so search finds what "de", "det" or "punkt 2" refer to. Without history,
+    or if the rewrite fails, a simpler fallback is used."""
+    if not history:
+        return question
+    msg = await worker_call({"type": "rewrite", "model": model, "question": question, "history": history}, timeout=120)
+    if msg["type"] == "rewritten" and msg.get("query"):
+        return msg["query"]
+    return f"{history[-1]['question']} {question}"  # fallback: previous question plus the new one
+
+
 async def run_question(s: Session, job_id: str, question: str, model: str) -> None:
     """Search the user's index, then let the worker re-rank and answer. Buffered
     server-side so a page reload can resume following it."""
@@ -726,20 +751,27 @@ async def run_question(s: Session, job_id: str, question: str, model: str) -> No
         idx = await ensure_index(s)
         if not idx.docs:
             buf["note"] = "Biblioteket är tomt."
-            _finish(buf, "Du har inga dokument ännu. Ladda upp PDF- eller DOCX-filer under **Dokument**.")
+            _finish(buf, "Du har inga dokument ännu. Ladda upp dokument under **Dokument**.")
             return
-        plan = plan_question(question)
+        history = _history(s)
+        if history:
+            _set_status(buf, "Tolkar följdfrågan", "Utifrån tidigare frågor i samtalet...")
+        search_query = await standalone_query(question, history, model)
+        if search_query != question:
+            buf["interpreted"] = search_query
+            _set_status(buf, "Söker i dina dokument", f"Söker efter: {search_query}")
+        plan = plan_question(search_query)
         candidates: list[dict] = []
         if plan.needs_retrieval:
-            msg = await worker_call({"type": "embed", "text": question}, timeout=120)
+            msg = await worker_call({"type": "embed", "text": search_query}, timeout=120)
             if msg["type"] != "embedding":
                 _finish(buf, error=msg.get("message", "Okänt fel"))
                 return
             if msg.get("embed_model") != idx.embed_model:
                 idx = await ensure_index(s)
             qvec = np.asarray(msg["vector"], dtype=np.float32)
-            candidates = await run.io_bound(idx.candidates, question, qvec, plan.analytical)
-        stats, stats_docs = idx.stats_context(question) if plan.aggregate else ("", 0)
+            candidates = await run.io_bound(idx.candidates, search_query, qvec, plan.analytical)
+        stats, stats_docs = idx.stats_context(search_query) if plan.aggregate else ("", 0)
         buf["note"] = (
             f"Svaret bygger på uppgifter om alla {len(idx.docs)} dokument i biblioteket (år, typ, språk), inte på enskilda dokument."
             if stats else "Inga dokument i biblioteket användes för svaret."
@@ -751,6 +783,8 @@ async def run_question(s: Session, job_id: str, question: str, model: str) -> No
             "id": job_id,
             "model": model,
             "question": question,
+            "search_query": search_query,
+            "history": history,
             "analytical": plan.analytical,
             "aggregate": plan.aggregate,
             "candidates": candidates,
@@ -793,11 +827,15 @@ async def follow_job(job_id: str):
 
     last_len = 0
     sources_sent = False
+    last_status = None
     event = asyncio.Event()
     buf["events"].add(event)
 
     try:
         while True:
+            if buf.get("status") and buf["status"] != last_status and not buf["text"]:
+                last_status = buf["status"]
+                yield {"type": "status", "step": last_status[0], "detail": last_status[1]}
             if buf["sources"] and not sources_sent:
                 sources_sent = True
                 yield {"type": "sources", "sources": buf["sources"]}
@@ -810,7 +848,7 @@ async def follow_job(job_id: str):
                 if buf["error"]:
                     yield {"type": "error", "message": buf["error"]}
                 else:
-                    yield {"type": "done", "note": buf.get("note", "")}
+                    yield {"type": "done", "note": buf.get("note", ""), "interpreted": buf.get("interpreted", "")}
                 break
 
             event.clear()
@@ -2181,8 +2219,10 @@ async def main_page():
             empty_state.set_visibility(False)
             with conversation:
                 with ui.column().classes("w-full gap-3 vr-turn"):
-                    with ui.row().classes("w-full justify-end"):
+                    with ui.column().classes("w-full items-end gap-1"):
                         ui.label(question_label).classes("vr-user-msg")
+                        self.interpreted = ui.label("").classes("text-caption vr-status")
+                        self.interpreted.set_visibility(False)
                     with ui.row().classes("items-center vr-progress") as self.progress:
                         ui.spinner("dots", size="md", color="black")
                         with ui.column().classes("gap-0"):
@@ -2225,6 +2265,12 @@ async def main_page():
             self.stream.set_content(normalize_bullets(text))
             self.stream.set_visibility(True)
             self.answer.set_visibility(True)
+
+        def set_interpreted(self, query: str):
+            """A follow-up question as it was understood from the conversation."""
+            if query:
+                self.interpreted.set_text(f"Tolkad som: {query}")
+                self.interpreted.set_visibility(True)
 
         def render_final(self, text: str, sources: list[dict] | None = None, note: str = ""):
             """Parse text for chart blocks and render mixed markdown + Plotly."""
@@ -2292,7 +2338,9 @@ async def main_page():
         full_text = ""
         sources: list[dict] = []
         async for msg in follow_job(job_id):
-            if msg["type"] == "sources":
+            if msg["type"] == "status":
+                turn.set_progress(msg["step"], msg["detail"])
+            elif msg["type"] == "sources":
                 sources = msg["sources"]
                 if not full_text:
                     n = len(sources)
@@ -2310,7 +2358,9 @@ async def main_page():
                 turn.render_stream(f"{full_text}\n\n**Fel:** {msg['message']}")
             elif msg["type"] == "done":
                 turn.render_final(full_text, sources, msg.get("note", ""))
-                s.turns.append({"question": question, "text": full_text, "sources": sources, "note": msg.get("note", "")})
+                turn.set_interpreted(msg.get("interpreted", ""))
+                s.turns.append({"question": question, "text": full_text, "sources": sources, "note": msg.get("note", ""),
+                                "interpreted": msg.get("interpreted", "")})
         if s.active_job == job_id:
             s.active_job = None
 
@@ -2361,6 +2411,19 @@ async def main_page():
                 )
 
                 with ui.row().classes("w-full items-center no-wrap gap-2"):
+
+                    def new_conversation():
+                        if s.active_job:
+                            ui.notify("Vänta tills svaret är klart.")
+                            return
+                        s.turns = []
+                        conversation.clear()
+                        empty_state.set_visibility(True)
+                        question_input.run_method("focus")
+
+                    ui.button("Ny konversation", icon="add_comment", on_click=new_conversation, color=None).props(
+                        "flat no-caps size=sm"
+                    ).classes("vr-btn vr-plain").tooltip("Börja om: nya frågor bygger inte på de tidigare")
 
                     ui.space()
 
@@ -2417,7 +2480,9 @@ async def main_page():
 
     # --- Restore this session's conversation, and resume a running answer ---
     for t in s.turns:
-        Turn(t["question"]).render_final(t["text"], t["sources"], t.get("note", ""))
+        restored = Turn(t["question"])
+        restored.render_final(t["text"], t["sources"], t.get("note", ""))
+        restored.set_interpreted(t.get("interpreted", ""))
     job = active_jobs.get(s.active_job or "")
     if job and job["owner"] == s.user_id:
         turn = Turn(job["question"])

@@ -21,8 +21,11 @@ Protocol (JSON over WebSocket):
     UI -> Worker:  {"type": "cancel", "id"}                          stops a running ingest job
     UI -> Worker:  {"type": "embed", "id", "text"}
     Worker -> UI:  {"type": "embedding", "id", "vector": [...], "embed_model"}
-    UI -> Worker:  {"type": "answer", "id", "model", "question", "analytical", "aggregate",
-                    "candidates": [...], "stats", "text_search", "extra_sources": [...], "num_docs"}
+    UI -> Worker:  {"type": "rewrite", "id", "model", "question", "history": [{"question", "answer"}, ...]}
+    Worker -> UI:  {"type": "rewritten", "id", "query"}                follow-up as a standalone search query
+    UI -> Worker:  {"type": "answer", "id", "model", "question", "search_query", "history",
+                    "analytical", "aggregate", "candidates": [...], "stats", "text_search",
+                    "extra_sources": [...], "num_docs"}
     Worker -> UI:  {"type": "sources", "id", "sources": [...]}
     Worker -> UI:  {"type": "chunk",   "id", "text", "num_sources"}
     Worker -> UI:  {"type": "done",    "id"}
@@ -37,6 +40,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import resource
 import socket
 import sys
@@ -276,7 +280,7 @@ def expand_context(hits: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> str:
     return "\n\n---\n\n".join(out)
 
 
-def broad_context(query: str, candidates: list[dict]) -> tuple[str, list[dict]]:
+def broad_context(query: str, candidates: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, list[dict]]:
     """Analytical questions: list matching documents with brief excerpts."""
     ranked = rerank(query, candidates, top_k=BROAD_TOP_K)
     sources, seen, parts, total = [], set(), [], 0
@@ -285,7 +289,7 @@ def broad_context(query: str, candidates: list[dict]) -> tuple[str, list[dict]]:
             continue
         excerpt = hit["text"][:300].replace("\n", " ")
         entry = f"### {hit['meta'].get('filename', 'okänd')} (relevans: {hit['rerank_score']:.2f})\n{excerpt}..."
-        if total + len(entry) > MAX_CONTEXT_CHARS:
+        if total + len(entry) > max_chars:
             break
         seen.add(hit["doc_id"])
         sources.append(_source_entry(hit["meta"]))
@@ -303,20 +307,24 @@ def _llm_headers() -> dict:
     return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
 
-def llm_chat_stream(model: str, messages: list[dict]):
+def llm_chat_stream(model: str, messages: list[dict], max_tokens: int | None = None, temperature: float | None = None):
     """Stream assistant text from the configured LLM backend, one piece at a time.
 
     Reasoning/thinking tokens are never yielded. Backend error bodies are not
     passed on: they can echo the prompt.
     """
+    temperature = LLM_TEMPERATURE if temperature is None else temperature
     if LLM_API == "ollama":
         url = f"{LLM_URL}/api/chat"
+        options = {"num_ctx": NUM_CTX, "temperature": temperature, "seed": LLM_SEED}
+        if max_tokens:
+            options["num_predict"] = max_tokens
         body = {
             "model": model,
             "messages": messages,
             "stream": True,
             "think": LLM_THINK,
-            "options": {"num_ctx": NUM_CTX, "temperature": LLM_TEMPERATURE, "seed": LLM_SEED},
+            "options": options,
         }
     else:
         url = f"{LLM_URL}/chat/completions"
@@ -324,9 +332,11 @@ def llm_chat_stream(model: str, messages: list[dict]):
             "model": model,
             "messages": messages,
             "stream": True,
-            "temperature": LLM_TEMPERATURE,
+            "temperature": temperature,
             "seed": LLM_SEED,  # vLLM and llama-server honour it; others ignore it
         }
+        if max_tokens:
+            body["max_tokens"] = max_tokens
         if not LLM_THINK:
             # Honoured by vLLM/mlx-lm for models with a thinking switch; ignored elsewhere.
             body["chat_template_kwargs"] = {"enable_thinking": False}
@@ -381,9 +391,49 @@ def llm_list_models() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+HISTORY_ANSWER_CHARS = 1500  # each earlier answer, as the model sees it in the history
+_CHART_BLOCK = re.compile(r"```chart.*?```", re.DOTALL)
+
+
+def _history_messages(history: list[dict], answer_chars: int) -> list[dict]:
+    """Earlier turns of the conversation as chat messages, answers shortened
+    and without chart blocks."""
+    messages = []
+    for turn in history:
+        answer = _CHART_BLOCK.sub("[diagram]", str(turn.get("answer") or "")).strip()
+        if len(answer) > answer_chars:
+            answer = answer[:answer_chars].rsplit(" ", 1)[0] + " […]"
+        messages += [
+            {"role": "user", "content": str(turn.get("question") or "")},
+            {"role": "assistant", "content": answer or "(inget svar)"},
+        ]
+    return messages
+
+
+REWRITE_PROMPT = """Du gör om följdfrågor till fristående sökfrågor. Du får ett samtal och en ny fråga. Skriv EN fristående fråga på svenska som går att förstå utan samtalet: ersätt ord som "de", "det", "den där", "punkt 2" med vad de syftar på, och ta med ämnen, namn, år och dokument som behövs för att söka i dokumenten. Behåll ord inom citattecken exakt. Är frågan redan fristående, skriv den oförändrad. Svara bara med frågan, utan förklaring."""
+
+
+def rewrite_question(job: dict, model: str) -> str:
+    """A standalone search query for a follow-up question. Falls back to the question itself."""
+    question = str(job["question"])
+    lines = []
+    for turn in job.get("history") or []:
+        answer = _CHART_BLOCK.sub("", str(turn.get("answer") or "")).strip()
+        lines.append(f"Fråga: {turn.get('question', '')}\nSvar: {answer[:600]}")
+    user = "Samtalet hittills:\n\n" + "\n\n".join(lines) + f"\n\nNy fråga: {question}\n\nFristående fråga:"
+    messages = [{"role": "system", "content": REWRITE_PROMPT}, {"role": "user", "content": user}]
+    text = "".join(llm_chat_stream(model, messages, max_tokens=120, temperature=0)).strip()
+    text = text.splitlines()[0].strip() if text else ""
+    text = re.sub(r"^(fristående fråga|fråga)\s*:\s*", "", text, flags=re.IGNORECASE).strip().strip("*").strip()
+    return text[:400] if len(text) >= 3 else question
+
+
 def process_answer(job: dict, model: str):
     """Generator yielding (sources, num_sources, token) tuples."""
     question = job["question"]
+    search_query = job.get("search_query") or question  # a follow-up, rewritten to stand alone
+    history = _history_messages(job.get("history") or [], HISTORY_ANSWER_CHARS)
+    budget = max(20_000, MAX_CONTEXT_CHARS - sum(len(m["content"]) for m in history))
     analytical = bool(job.get("analytical"))
     aggregate = bool(job.get("aggregate"))
     candidates = job.get("candidates") or []
@@ -391,10 +441,10 @@ def process_answer(job: dict, model: str):
     text_search_context = job.get("text_search") or ""
 
     if analytical and candidates:
-        context, sources = broad_context(question, candidates)
+        context, sources = broad_context(search_query, candidates, budget)
     elif candidates:
-        ranked = rerank(question, candidates)
-        context, sources = expand_context(ranked), _unique_sources(ranked)
+        ranked = rerank(search_query, candidates)
+        context, sources = expand_context(ranked, max_chars=budget), _unique_sources(ranked)
     else:
         context, sources = "", []
 
@@ -425,11 +475,13 @@ def process_answer(job: dict, model: str):
         instruction = "Baserat på dokumenten ovan, besvara frågan eller ge din analys och rekommendation."
 
     combined = "\n\n---\n\n".join(sections)
-    user_prompt = f"{combined}\n\n## Fråga\n\n{question}\n\n## Ditt svar\n\n{instruction}"
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    asked = question
+    if search_query != question:
+        asked += f"\n\n(Följdfråga, tolkad som: {search_query})"
+    user_prompt = f"{combined}\n\n## Fråga\n\n{asked}\n\n## Ditt svar\n\n{instruction}"
+    # Earlier turns first, so the model can follow up on its own answers; the
+    # document context for this question comes with the new question.
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_prompt}]
     # Sources first (empty text): the prompt can take minutes to read before the
     # first token, and the UI shows what is being read meanwhile.
     yield sources, num_sources, ""
@@ -526,6 +578,11 @@ async def handle_job(ws, msg: dict):
         elif job_type == "embed":
             vec = await asyncio.to_thread(_locked, embed_query, embed_model, str(msg["text"]))
             await ws.send(json.dumps({"type": "embedding", "id": job_id, "vector": vec.tolist(), "embed_model": EMBED_MODEL}))
+
+        elif job_type == "rewrite":
+            model = msg.get("model") or MODEL
+            query = await asyncio.to_thread(rewrite_question, msg, model)
+            await ws.send(json.dumps({"type": "rewritten", "id": job_id, "query": query}))
 
         elif job_type == "answer":
             model = msg.get("model") or MODEL

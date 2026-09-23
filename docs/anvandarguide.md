@@ -187,6 +187,19 @@ uppgifter om alla dokument och inte på enskilda dokument.
 
 ![En statistikfråga besvarad med ett stapeldiagram](bilder/12-statistikfraga.png)
 
+### Följdfrågor
+
+Du kan fortsätta samtalet med följdfrågor, till exempel *Förklara den andra
+punkten närmare* eller *Och per dokumenttyp?*. Tjänsten minns de tre senaste
+frågorna och svaren i samtalet. Före sökningen tolkas följdfrågan som en
+fristående fråga, och tolkningen visas under din fråga ("Tolkad som: …"), så
+att du kan se vad som faktiskt söktes efter. Blev tolkningen fel kan du
+ställa frågan igen med fler ord.
+
+Byter du ämne klickar du på **Ny konversation** till vänster under
+frågerutan. Då glöms de tidigare frågorna, och nästa fråga besvaras helt för
+sig. Samtalet glöms också när du loggar ut.
+
 Tips:
 
 - Fråga konkret och använd de ord som står i dokumenten.
