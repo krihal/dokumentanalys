@@ -8,3 +8,4 @@ bm25_index.tmp
 full_texts.json
 full_texts.tmp
 *.log
+vault/

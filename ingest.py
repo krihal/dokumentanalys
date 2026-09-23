@@ -1,54 +1,47 @@
-"""Ingest PDF documents into ChromaDB + BM25 for RAG-based decision support.
+"""Turn one PDF, DOCX or HTML file into searchable chunks and embeddings.
+
+Runs on the worker. Everything happens in memory: the file arrives as bytes,
+nothing is written to disk and nothing about the content is logged. The
+result goes back to the app, which encrypts it for the user (see vault.py).
 
 Pipeline per document:
-  1. Text extraction with PyMuPDF (optional OCR fallback for scanned pages)
+  1. Text extraction: PyMuPDF for PDF (optional OCR for scanned pages),
+     word/document.xml for DOCX, visible text for HTML (e.g. exported e-mail)
   2. Cleaning: repeated headers/footers, page numbers, TOC dot leaders,
      line-break hyphenation
   3. Metadata: date, year, diarienummer, language, document type
   4. Structural section detection (Swedish + English headings)
   5. Sentence-aware chunking sized to the embedding model's token limit
-  6. Embedding with a multilingual model, stored in ChromaDB
-  7. Full text stored in full_texts.json; BM25 index rebuilt from ChromaDB
+  6. Embedding with a multilingual model
 
-Usage:
-    uv run ingest.py <pdf-mapp> [--reset] [--ocr] [--limit N]
+Usage (local check, prints counts only):
+    uv run ingest.py <fil.pdf|fil.docx> [--ocr]
 
 Environment:
     EMBED_MODEL   sentence-transformers model name (default: multilingual-e5-small)
-    RAG_DATA_DIR  where chroma_db/, bm25_index.pkl and full_texts.json live
-                  (default: this directory)
 """
 
 import argparse
+import base64
+import codecs
 import hashlib
-import json
+import io
 import os
-import pickle
 import re
-import sys
 import time
+import zipfile
 from collections import Counter
+from collections.abc import Callable
+from html.parser import HTMLParser
 from pathlib import Path
+from xml.etree import ElementTree
 
-import chromadb
 import fitz  # pymupdf
+import numpy as np
 from dotenv import load_dotenv
-from rank_bm25 import BM25Okapi
-from rich.console import Console
-from rich.progress import (
-    track,
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from sentence_transformers import SentenceTransformer
 
 load_dotenv()
-
-console = Console()
 
 # --- Embedding -------------------------------------------------------------
 
@@ -68,14 +61,10 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 MIN_CHUNK_CHARS = 80
 
-# --- Storage ---------------------------------------------------------------
+# --- Input ------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("RAG_DATA_DIR", Path(__file__).parent))
-CHROMA_DIR = DATA_DIR / "chroma_db"
-BM25_PATH = DATA_DIR / "bm25_index.pkl"
-FULL_TEXTS_PATH = DATA_DIR / "full_texts.json"
-COLLECTION_NAME = "decisions"
-CHECKPOINT_EVERY = 20  # docs between full_texts.json saves
+MAX_FILE_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MIN_TEXT_CHARS = 100
 
 # --- Section detection -----------------------------------------------------
 
@@ -149,14 +138,13 @@ _DOC_TYPES = [
 
 PAGE_NUM_RE = re.compile(r"^(?:sida\s+|page\s+|s\.\s*)?\d{1,4}(?:\s*[(/]\s*\d{1,4}\s*\)?)?$", re.I)
 DOT_LEADER_RE = re.compile(r"(?:\.\s?){5,}|_{5,}")
-TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 _HYPHEN_LOWER = re.compile(r"([a-zåäöéü])-\n([a-zåäöéü])")
 _HYPHEN_OTHER = re.compile(r"([A-ZÅÄÖ0-9])-\n([a-zåäöéü])")
 
 
 # ===========================================================================
-# Shared helpers (used by worker.py / query.py too)
+# Embedding (the worker also embeds queries with these)
 # ===========================================================================
 
 
@@ -167,24 +155,35 @@ def load_embed_model() -> SentenceTransformer:
     return model
 
 
-def embed_passages(model: SentenceTransformer, texts: list[str]) -> list[list[float]]:
+def embed_passages(model: SentenceTransformer, texts: list[str], progress: Progress | None = None) -> np.ndarray:
+    """Embed in batches so progress can be reported (and cancellation checked) between them."""
+    out = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = [PASSAGE_PREFIX + t for t in texts[i : i + EMBED_BATCH_SIZE]]
+        out.append(model.encode(batch, batch_size=EMBED_BATCH_SIZE, normalize_embeddings=True,
+                                convert_to_numpy=True, show_progress_bar=False))
+        if progress:
+            progress("embed", min(i + EMBED_BATCH_SIZE, len(texts)), len(texts))
+    return np.vstack(out).astype(np.float32)
+
+
+def embed_query(model: SentenceTransformer, text: str) -> np.ndarray:
     return model.encode(
-        [PASSAGE_PREFIX + t for t in texts],
-        batch_size=EMBED_BATCH_SIZE,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).tolist()
+        [QUERY_PREFIX + text], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
+    )[0].astype(np.float32)
 
 
-def embed_query(model: SentenceTransformer, text: str) -> list[list[float]]:
-    return model.encode(
-        [QUERY_PREFIX + text], normalize_embeddings=True, convert_to_numpy=True
-    ).tolist()
+class DocumentError(Exception):
+    """The file cannot be ingested. The message is safe to show and never quotes content."""
 
 
-def bm25_tokenize(text: str) -> list[str]:
-    """Tokenizer shared by index build and query time — must be identical."""
-    return TOKEN_RE.findall(text.lower())
+class Cancelled(Exception):
+    """Raised by a progress callback to stop processing."""
+
+
+# progress(stage, done, total): stage is "extract" (pages) or "embed" (chunks).
+# It may raise Cancelled to abort.
+Progress = Callable[[str, int, int], None]
 
 
 # ===========================================================================
@@ -201,19 +200,23 @@ def _ocr_languages() -> str:
     return "+".join(langs) or "eng"
 
 
-def extract_pages(pdf_path: Path, ocr: bool = False) -> list[str]:
-    """Return raw text per page. With ocr=True, pages without a text layer are OCR'd."""
+def extract_pdf_pages(data: bytes, ocr: bool = False, progress: Progress | None = None) -> list[str]:
+    """Raw text per page of an in-memory PDF. With ocr=True, pages without a text layer are OCR'd."""
     pages = []
     ocr_langs = _ocr_languages() if ocr else None
-    with fitz.open(pdf_path) as doc:
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        if doc.needs_pass:
+            raise DocumentError("PDF:en är lösenordsskyddad.")
         for page in doc:
+            if progress:
+                progress("extract", page.number, doc.page_count)
             text = page.get_text()
             if ocr and len(text.strip()) < 20:
                 try:
                     tp = page.get_textpage_ocr(language=ocr_langs, dpi=200, full=True)
                     text = page.get_text(textpage=tp)
-                except Exception as e:  # tesseract missing, bad image, ...
-                    console.print(f"  [yellow]OCR misslyckades ({pdf_path.name} s.{page.number + 1}): {e}[/yellow]")
+                except Exception:  # tesseract missing, bad image, ... keep the empty page
+                    pass
             pages.append(text)
     return pages
 
@@ -262,9 +265,100 @@ def clean_pages(pages: list[str]) -> str:
     return text.strip()
 
 
-def extract_text_from_pdf(pdf_path: Path, ocr: bool = False) -> str:
-    """Extract and clean all text from a PDF file."""
-    return clean_pages(extract_pages(pdf_path, ocr=ocr))
+class _HTMLText(HTMLParser):
+    """Visible text of an HTML document. Nothing is fetched or executed: the
+    parser only tokenizes, and script/style/head content is dropped."""
+
+    SKIP = {"script", "style", "head", "title", "noscript", "template", "svg", "object", "iframe"}
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "table", "section", "article",
+             "blockquote", "pre", "hr", "ul", "ol", "dd", "dt"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+        elif tag in ("td", "th"):
+            self.parts.append("\t")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+
+def html_charset(data: bytes) -> str:
+    """Declared charset (meta tag), else UTF-8 if it decodes, else Windows-1252."""
+    m = re.search(rb"""charset\s*=\s*["']?([A-Za-z0-9_.:-]+)""", data[:4096], re.I)
+    if m:
+        name = m.group(1).decode("ascii")
+        try:
+            codecs.lookup(name)
+            return name
+        except LookupError:
+            pass
+    try:
+        data.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "cp1252"
+
+
+def extract_html_pages(data: bytes) -> list[str]:
+    """Text of an in-memory HTML document (e.g. an exported e-mail) as one "page"."""
+    parser = _HTMLText()
+    parser.feed(data.decode(html_charset(data), errors="replace"))
+    parser.close()
+    text = "".join(parser.parts).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    return [re.sub(r"\n\s*\n\s*", "\n\n", text).strip()]
+
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+DOCX_MAX_XML_BYTES = 200_000_000  # decompressed word/document.xml; guards against zip bombs
+
+
+def extract_docx_pages(data: bytes) -> list[str]:
+    """Text of an in-memory DOCX as a single "page", one line per paragraph.
+
+    Reads word/document.xml directly. Documents with a DTD are refused, so
+    entity expansion and external entities are never processed.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            info = z.getinfo("word/document.xml")
+            if info.file_size > DOCX_MAX_XML_BYTES:
+                raise DocumentError("DOCX-filen är för stor.")
+            xml = z.read(info)
+    except (zipfile.BadZipFile, KeyError):
+        raise DocumentError("Filen är inte en giltig DOCX.") from None
+    if b"<!DOCTYPE" in xml or b"<!ENTITY" in xml:
+        raise DocumentError("DOCX-filen innehåller otillåten XML.")
+
+    paragraphs, parts = [], []
+    for event, el in ElementTree.iterparse(io.BytesIO(xml), events=("end",)):
+        tag = el.tag
+        if tag == _W + "t":
+            parts.append(el.text or "")
+        elif tag == _W + "tab":
+            parts.append("\t")
+        elif tag in (_W + "br", _W + "cr"):
+            parts.append("\n")
+        elif tag == _W + "p":
+            paragraphs.append("".join(parts))
+            parts = []
+            el.clear()
+    return ["\n".join(paragraphs)]
 
 
 # ===========================================================================
@@ -341,7 +435,10 @@ def extract_metadata(text: str, filename: str, pages: int = 0) -> dict:
                 metadata["decision_type"] = dtype
                 break
 
-    for line in text.split("\n"):
+    subject = re.search(r"^(?:Ämne|Subject):[ \t]*(\S.{3,150})$", text[:3000], re.M)  # exported e-mail
+    if subject:
+        metadata["title"] = subject.group(1).strip()
+    for line in text.split("\n") if not subject else ():
         line = line.strip()
         if 10 <= len(line) <= 120 and sum(c.isalpha() for c in line) > len(line) * 0.6:
             metadata["title"] = line
@@ -493,334 +590,87 @@ def fit_to_token_limit(chunks: list[dict], tokenizer, limit: int) -> list[dict]:
     return out
 
 
-# ===========================================================================
-# Storage helpers
-# ===========================================================================
-
-
-def _file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def chunk_id(source: str, index: int) -> str:
-    return f"{hashlib.sha1(source.encode()).hexdigest()[:16]}_{index}"
-
-
-def _iter_collection(collection, batch: int = 5000):
-    offset = 0
-    while True:
-        res = collection.get(limit=batch, offset=offset, include=["documents", "metadatas"])
-        if not res["ids"]:
-            break
-        yield from zip(res["documents"], res["metadatas"])
-        offset += len(res["ids"])
-        if len(res["ids"]) < batch:
-            break
-
-
-def build_bm25(collection) -> int:
-    """Rebuild the BM25 index from everything in ChromaDB. Returns corpus size."""
-    corpus = [
-        {
-            "doc_id": meta["filename"],
-            "text": doc,
-            "section": meta.get("section", ""),
-            "source": meta.get("source", ""),
-            "chunk_index": meta.get("chunk_index", 0),
-        }
-        for doc, meta in _iter_collection(collection)
-    ]
-    if not corpus:
-        return 0
-    bm25 = BM25Okapi([bm25_tokenize(item["text"]) for item in corpus])
-    tmp = BM25_PATH.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
-        pickle.dump({"bm25": bm25, "corpus": corpus, "tokenizer": "ingest.bm25_tokenize"}, f)
-    tmp.replace(BM25_PATH)
-    return len(corpus)
-
-
-def _save_full_texts(full_texts: dict[str, str]) -> None:
-    tmp = FULL_TEXTS_PATH.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(full_texts, f, ensure_ascii=False)
-    tmp.replace(FULL_TEXTS_PATH)
-
-
-MANIFEST_KEYS = ("url", "page_url")
-
-
-def load_manifest(pdf_dir: str | Path | None) -> dict[str, dict]:
-    """filename -> {"url": ..., "page_url": ...} from manifest.json, written by the
-    vr.se downloader. RAG_MANIFEST overrides the default <pdf_dir>/manifest.json."""
-    path = os.environ.get("RAG_MANIFEST") or (Path(pdf_dir).expanduser() / "manifest.json" if pdf_dir else None)
-    if not path or not Path(path).exists():
-        return {}
-    with open(path) as f:
-        raw = json.load(f)
-    out = {}
-    for name, entry in raw.items():
-        fields = {}
-        if entry.get("url"):
-            fields["url"] = entry["url"]
-        if entry.get("page"):
-            fields["page_url"] = entry["page"]
-        if fields:
-            out[name] = fields
-    return out
-
-
-def _load_full_texts() -> dict[str, str]:
-    if FULL_TEXTS_PATH.exists():
-        with open(FULL_TEXTS_PATH) as f:
-            return json.load(f)
-    return {}
-
 
 # ===========================================================================
-# Main ingest
+# Whole document
 # ===========================================================================
 
 
-def ingest(pdf_dir: str, reset: bool = False, ocr: bool = False, limit: int | None = None):
-    """Ingest all PDFs from a directory into ChromaDB, full_texts.json and BM25."""
-    t_start = time.time()
-    pdf_path = Path(pdf_dir).expanduser()
-    manifest = load_manifest(pdf_path)
-    if manifest:
-        console.print(f"Manifest: källänkar för {len(manifest)} filer")
-    if not pdf_path.exists():
-        console.print(f"[red]Mappen hittades inte: {pdf_dir}[/red]")
-        sys.exit(1)
+_HTML_START = re.compile(rb"^(?:\xef\xbb\xbf)?\s*(?:<!--.*?-->\s*)*<(?:!doctype\s+html|html|head|body|meta)\b", re.I | re.S)
 
-    pdfs = sorted(p for p in pdf_path.glob("**/*") if p.suffix.lower() == ".pdf")
-    if limit:
-        pdfs = pdfs[:limit]
-    if not pdfs:
-        console.print(f"[red]Inga PDF-filer hittades i {pdf_dir}[/red]")
-        sys.exit(1)
-    console.print(f"Hittade [bold]{len(pdfs)}[/bold] PDF-filer i {pdf_path}")
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-    if reset:
-        console.print("[yellow]--reset: tar bort befintligt index[/yellow]")
+def detect_kind(data: bytes) -> str:
+    """"pdf", "docx" or "html" from the file's content; the file name is not trusted.
+    (Mail and web pages exported from other systems are often saved as .pdf.)"""
+    if data[:5] == b"%PDF-":
+        return "pdf"
+    if _HTML_START.match(data[:4096]):
+        return "html"
+    if data[:4] == b"PK\x03\x04":
         try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                if "word/document.xml" in z.namelist():
+                    return "docx"
+        except zipfile.BadZipFile:
             pass
-        BM25_PATH.unlink(missing_ok=True)
-        FULL_TEXTS_PATH.unlink(missing_ok=True)
-
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine", "embed_model": EMBED_MODEL},
-    )
-    existing_model = (collection.metadata or {}).get("embed_model")
-    if collection.count() and existing_model != EMBED_MODEL:
-        console.print(
-            f"[red]Befintligt index är byggt med '{existing_model or 'okänd modell'}', "
-            f"men EMBED_MODEL är '{EMBED_MODEL}'. Kör med --reset för att bygga om.[/red]"
-        )
-        sys.exit(1)
-
-    console.print(f"Laddar inbäddningsmodell [bold]{EMBED_MODEL}[/bold]...")
-    model = load_embed_model()
-    tokenizer = model.tokenizer
-    max_batch = client.get_max_batch_size()
-
-    # What is already in the index?
-    existing_sources: dict[str, str] = {}  # source path -> filename
-    existing_hashes: dict[str, str] = {}  # sha256 -> filename
-    for _, meta in _iter_collection(collection):
-        existing_sources[meta["source"]] = meta["filename"]
-        if "sha256" in meta:
-            existing_hashes[meta["sha256"]] = meta["filename"]
-
-    full_texts = _load_full_texts()
-
-    # Repair: docs in ChromaDB whose full text was lost (e.g. interrupted run)
-    missing = [Path(s) for s, name in existing_sources.items() if name not in full_texts and Path(s).exists()]
-    if missing:
-        console.print(f"Återskapar fulltext för {len(missing)} dokument...")
-        for p in missing:
-            full_texts[p.name] = extract_text_from_pdf(p, ocr=ocr)
-        _save_full_texts(full_texts)
-
-    total_chunks = skipped = duplicates = 0
-    no_text: list[str] = []
-    failed: list[str] = []
-    since_checkpoint = 0
-
-    progress = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    )
-    with progress:
-        task = progress.add_task("Bearbetar", total=len(pdfs))
-        for pdf_file in pdfs:
-            progress.update(task, advance=1, description=pdf_file.name[:50])
-            source = str(pdf_file)
-            if source in existing_sources:
-                skipped += 1
-                continue
-
-            sha = _file_sha256(pdf_file)
-            if sha in existing_hashes:
-                console.print(f"  [dim]Dubblett av {existing_hashes[sha]}: {pdf_file.name}[/dim]")
-                duplicates += 1
-                continue
-
-            try:
-                pages = extract_pages(pdf_file, ocr=ocr)
-                text = clean_pages(pages)
-            except Exception as e:
-                console.print(f"  [yellow]Hoppar över (kan ej läsa): {pdf_file.name} — {e}[/yellow]")
-                failed.append(pdf_file.name)
-                continue
-
-            if len(text) < 100:
-                no_text.append(pdf_file.name)
-                continue
-
-            metadata = extract_metadata(text, pdf_file.name, pages=len(pages))
-            metadata.update(manifest.get(pdf_file.name, {}))
-            chunks = fit_to_token_limit(structural_chunk(text), tokenizer, MAX_TOKENS)
-            if not chunks:
-                no_text.append(pdf_file.name)
-                continue
-
-            chunk_texts = [c["text"] for c in chunks]
-            embeddings = embed_passages(model, chunk_texts)
-
-            ids = [chunk_id(source, i) for i in range(len(chunks))]
-            metadatas = []
-            for c in chunks:
-                meta = {
-                    "source": source,
-                    "filename": pdf_file.name,
-                    "sha256": sha,
-                    "section": c["section"],
-                    "chunk_index": c["chunk_index"],
-                    "total_chunks": len(chunks),
-                    "full_text_chars": len(text),
-                }
-                meta.update(metadata)
-                metadatas.append(meta)
-
-            for i in range(0, len(ids), max_batch):
-                collection.add(
-                    ids=ids[i : i + max_batch],
-                    embeddings=embeddings[i : i + max_batch],
-                    documents=chunk_texts[i : i + max_batch],
-                    metadatas=metadatas[i : i + max_batch],
-                )
-            existing_sources[source] = pdf_file.name
-            existing_hashes[sha] = pdf_file.name
-            full_texts[pdf_file.name] = text
-            total_chunks += len(chunks)
-
-            since_checkpoint += 1
-            if since_checkpoint >= CHECKPOINT_EVERY:
-                _save_full_texts(full_texts)
-                since_checkpoint = 0
-
-    _save_full_texts(full_texts)
-
-    console.print("Bygger BM25-index från databasen...")
-    bm25_size = build_bm25(collection)
-
-    elapsed = time.time() - t_start
-    new_docs = len(pdfs) - skipped - duplicates - len(no_text) - len(failed)
-    console.print(
-        f"\n[green]Klart på {elapsed / 60:.1f} min.[/green] Matade in [bold]{total_chunks}[/bold] stycken "
-        f"från {new_docs} nya PDF:er ({skipped} redan inmatade, {duplicates} dubbletter)."
-    )
-    if no_text:
-        console.print(
-            f"[yellow]{len(no_text)} PDF:er utan textlager (skannade?) hoppades över"
-            f"{'' if ocr else ' — prova --ocr'}:[/yellow]"
-        )
-        for name in no_text:
-            console.print(f"  - {name}")
-    if failed:
-        console.print(f"[yellow]{len(failed)} PDF:er kunde inte läsas:[/yellow]")
-        for name in failed:
-            console.print(f"  - {name}")
-    console.print(f"Databas: {CHROMA_DIR} ({collection.count()} stycken, {len(existing_sources)} dokument)")
-    console.print(f"BM25-index: {BM25_PATH} ({bm25_size} stycken)")
-    console.print(f"Fulltexter: {FULL_TEXTS_PATH} ({len(full_texts)} dokument)")
+    raise DocumentError("Filen är varken PDF, DOCX eller HTML, oavsett vad den heter.")
 
 
-def refresh_metadata(pdf_dir: str | None = None) -> int:
-    """Recompute document metadata from stored full texts and update ChromaDB.
+def process_document(
+    data: bytes, filename: str, model: SentenceTransformer, ocr: bool = False, progress: Progress | None = None
+) -> dict:
+    """Extract, clean, chunk and embed one file. Returns the document record
+    the app encrypts: text, chunks, metadata and base64 float32 embeddings."""
+    if len(data) > MAX_FILE_BYTES:
+        raise DocumentError("Filen är för stor.")
+    kind = detect_kind(data)
+    if progress:
+        progress("extract", 0, 0)
+    try:
+        if kind == "pdf":
+            pages = extract_pdf_pages(data, ocr=ocr, progress=progress)
+        elif kind == "docx":
+            pages = extract_docx_pages(data)
+        else:
+            pages = extract_html_pages(data)
+    except (DocumentError, Cancelled):
+        raise
+    except Exception:
+        raise DocumentError("Filen kunde inte läsas.") from None
+    text = clean_pages(pages)
+    if len(text) < MIN_TEXT_CHARS:
+        raise DocumentError("Ingen text kunde extraheras (skannad fil utan OCR?).")
 
-    Lets metadata heuristics improve without re-extracting or re-embedding.
-    Source links are taken from manifest.json if available (see load_manifest).
-    Returns the number of documents updated.
-    """
-    manifest = load_manifest(pdf_dir)
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    collection = client.get_collection(COLLECTION_NAME)
-    full_texts = _load_full_texts()
-    docs = {}
-    for _, meta in _iter_collection(collection):
-        docs.setdefault(meta["source"], meta)
-    updated = 0
-    for source, meta in track(list(docs.items()), description="Uppdaterar metadata"):
-        text = full_texts.get(meta["filename"])
-        if text is None:
-            continue
-        new = extract_metadata(text, meta["filename"], pages=meta.get("pages", 0))
-        new.update(manifest.get(meta["filename"], {}))
-        keys = ("date", "diarienummer", "year", "language", "doc_type", "decision_type", "title", "pages") + MANIFEST_KEYS
-        if all(meta.get(k) == new.get(k) for k in keys):
-            continue
-        total = int(meta["total_chunks"])
-        ids = [chunk_id(source, i) for i in range(total)]
-        res = collection.get(ids=ids, include=["metadatas"])
-        metadatas = []
-        for m in res["metadatas"]:
-            m = {k: v for k, v in m.items() if k not in keys}
-            m.update(new)
-            metadatas.append(m)
-        collection.update(ids=res["ids"], metadatas=metadatas)
-        updated += 1
-    return updated
+    metadata = extract_metadata(text, filename, pages=len(pages) if kind == "pdf" else 0)
+    chunks = fit_to_token_limit(structural_chunk(text), model.tokenizer, MAX_TOKENS)
+    if not chunks:
+        raise DocumentError("Ingen text kunde extraheras.")
+    embeddings = embed_passages(model, [c["text"] for c in chunks], progress)
+    return {
+        "v": 1,
+        "filename": filename,
+        "kind": kind,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "metadata": metadata,
+        "full_text": text,
+        "chunks": [{"text": c["text"], "section": c["section"]} for c in chunks],
+        "embed_model": EMBED_MODEL,
+        "dim": int(embeddings.shape[1]),
+        "embeddings": base64.b64encode(embeddings.tobytes()).decode(),
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Mata in PDF:er i sökindexet.")
-    parser.add_argument("pdf_dir", nargs="?", help="Mapp med PDF-filer (söks rekursivt)")
-    parser.add_argument("--reset", action="store_true", help="Ta bort befintligt index först")
+    parser = argparse.ArgumentParser(description="Provkör inläsning av en fil (skriver bara ut antal).")
+    parser.add_argument("file", help="PDF- eller DOCX-fil")
     parser.add_argument("--ocr", action="store_true", help="OCR:a sidor som saknar textlager (kräver tesseract)")
-    parser.add_argument("--limit", type=int, default=None, help="Bearbeta bara de N första filerna (test)")
-    parser.add_argument("--rebuild-bm25", action="store_true", help="Bygg bara om BM25-indexet från databasen")
-    parser.add_argument("--refresh-metadata", action="store_true", help="Räkna om metadata från lagrade fulltexter utan ny inbäddning (läser även manifest.json i PDF-mappen)")
     args = parser.parse_args()
-    if not args.pdf_dir and not (args.rebuild_bm25 or args.refresh_metadata):
-        parser.error("ange en PDF-mapp, --rebuild-bm25 eller --refresh-metadata")
-    if args.refresh_metadata:
-        n = refresh_metadata(args.pdf_dir)
-        console.print(f"[green]Klart.[/green] Metadata uppdaterad för {n} dokument")
-        return
-    if args.rebuild_bm25:
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        collection = client.get_collection(COLLECTION_NAME)
-        console.print("Bygger BM25-index från databasen...")
-        n = build_bm25(collection)
-        console.print(f"[green]Klart.[/green] BM25-index: {BM25_PATH} ({n} stycken)")
-        return
-    ingest(args.pdf_dir, reset=args.reset, ocr=args.ocr, limit=args.limit)
+    path = Path(args.file).expanduser()
+    t = time.time()
+    doc = process_document(path.read_bytes(), path.name, load_embed_model(), ocr=args.ocr)
+    print(f"{doc['kind']}: {len(doc['full_text'])} tecken, {len(doc['chunks'])} stycken, "
+          f"{doc['dim']} dim, {time.time() - t:.1f} s")
 
 
 if __name__ == "__main__":
