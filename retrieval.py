@@ -28,6 +28,10 @@ TEXT_SEARCH_MAX_DOCS = 50
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
 def bm25_tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
 
@@ -130,6 +134,13 @@ class Doc:
     full_text: str
     chunks: list[dict]
     embed_model: str
+    _search_text: str | None = field(default=None, repr=False)
+
+    def search_text(self) -> str:
+        """Full text with whitespace collapsed, for exact phrase search (cached)."""
+        if self._search_text is None:
+            self._search_text = _normalize(self.full_text)
+        return self._search_text
 
     def source_entry(self) -> dict:
         """What the UI needs to list and link a source document."""
@@ -250,25 +261,34 @@ class UserIndex:
     # --- whole-library answers ---------------------------------------------
 
     def text_search(self, terms: list[str]) -> tuple[str, list[dict]]:
-        """Exact, case-insensitive substring counts across all full texts."""
+        """Exact, case-insensitive search across all full texts. Any run of
+        whitespace counts as one space, so a name broken over two lines in the
+        PDF still matches. One excerpt per matched term and document."""
+        wanted = [(t, _normalize(t).lower()) for t in dict.fromkeys(terms) if t.strip()]
         results = []
         for doc in self.docs.values():
-            low = doc.full_text.lower()
-            matches = {t: low.count(t.lower()) for t in terms if t and low.count(t.lower())}
-            if not matches:
-                continue
-            first = next(iter(matches))
-            i = low.find(first.lower())
-            snippet = doc.full_text[max(0, i - 100) : i + len(first) + 200].replace("\n", " ").strip()
-            results.append((sum(matches.values()), doc, matches, snippet))
+            text = doc.search_text()
+            low = text.lower()
+            matches, excerpts = {}, {}
+            for term, needle in wanted:
+                n = low.count(needle)
+                if not n:
+                    continue
+                matches[term] = n
+                i = low.find(needle)
+                excerpts[term] = text[max(0, i - 120) : i + len(needle) + 120].strip()
+            if matches:
+                results.append((sum(matches.values()), doc, matches, excerpts))
         results.sort(key=lambda r: r[0], reverse=True)
         if not results:
             return f"**Textsökning för {terms}:** Inga dokument matchade.", []
         top = results[:TEXT_SEARCH_MAX_DOCS]
-        parts = [f"**Textsökning för {terms}:** {len(results)} dokument matchade.\n"]
-        for _, doc, matches, snippet in top:
-            info = ", ".join(f'"{t}": {c} träffar' for t, c in matches.items())
-            parts.append(f"- **{doc.filename}** ({info})\n  Utdrag: ...{snippet}...")
+        parts = [f"**Textsökning för {terms}:** {len(results)} dokument matchade."
+                 + (f" De {len(top)} med flest träffar visas." if len(top) < len(results) else "") + "\n"]
+        for _, doc, matches, excerpts in top:
+            parts.append(f"- **{doc.filename}**")
+            for term, n in matches.items():
+                parts.append(f'  - "{term}": {n} träffar. Utdrag: ...{excerpts[term]}...')
         return "\n".join(parts), [doc.source_entry() for _, doc, _, _ in top]
 
     def stats_context(self, question: str) -> tuple[str, int]:
